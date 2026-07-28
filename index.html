@@ -936,11 +936,15 @@ async function rememberAccount(force = false) {
   if (!accessToken) return;
   if (!force && store.get('rg_email')) return;
   try {
-    const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    // Ask Drive, not the userinfo endpoint — the token only carries the drive
+    // scope, so userinfo answers 401. drive/v3/about gives us the same thing
+    // without asking Ethan to approve anything new.
+    const r = await fetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
     if (!r.ok) return;
-    const j = await r.json();
+    const j = (await r.json()).user || {};
+    j.email = j.emailAddress;
     if (j.email) {
       store.set('rg_email', j.email);
       const el = document.getElementById('setEmail');
