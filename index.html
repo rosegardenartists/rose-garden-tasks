@@ -484,6 +484,52 @@
     }
     :root[data-theme="dark"] .toast-btn { color: #ffb894; }
 
+    /* ─── QUICK FLAGS ──────────────────────────────────────── */
+    /* Same manners as the drag handle and ⋯ : out of the way until you go
+       looking, except when one is switched on — then it stays lit, so the row
+       tells you its own status without needing a badge. */
+    /* Flags sit on the same line as the status badges, so a card that carries
+       one is no taller than one that doesn't. */
+    .task-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 4px; }
+    .task-foot .task-meta { margin-top: 0; }
+    .task-foot:only-child, .task-body > .task-foot:first-child { margin-top: 3px; }
+    .flags { display: flex; align-items: center; gap: 1px; flex-shrink: 0;
+      opacity: 0; transition: opacity .15s var(--ease); }
+    .task-card:hover .flags { opacity: 1; }
+    .flags:has(.flag.on) { opacity: 1; }
+    .task-card:focus-within .flags { opacity: 1; }
+    @media (hover: none) { .flags { opacity: 1; } .flag:not(.on) { opacity: .4; } }
+
+    .flag {
+      width: 25px; height: 25px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      border: none; background: none; cursor: pointer; padding: 0;
+      border-radius: 7px; font: inherit; font-size: 12px; line-height: 1;
+      color: var(--muted); transition: background .13s, color .13s, transform .13s;
+    }
+    .flag:hover  { background: var(--sidebar); color: var(--text2); }
+    .flag:active { transform: scale(.88); }
+    .flag.on              { background: var(--accent-lt); color: var(--accent-dk); font-weight: 700; }
+    .flag.on.urgent       { background: var(--urgent-bg); color: var(--urgent); }
+    .flag[data-flag="urgent"] { font-weight: 800; font-size: 14px; }
+    :root[data-theme="dark"] .flag.on { color: var(--accent); }
+
+    @media (max-width: 560px) {
+      .flag { width: 30px; height: 26px; font-size: 13px; }
+      .flag[data-flag="urgent"] { font-size: 15px; }
+      .flags { gap: 2px; }
+    }
+
+    /* On wider screens there's empty space to the right of every title, so the
+       flags live there — floated out of the layout, which means revealing them
+       on hover can't nudge the card taller or shuffle the list. */
+    @media (min-width: 561px) {
+      .task-body { padding-right: 150px; }
+      .flags { position: absolute; right: 66px; top: 8px; }
+      .task-foot { gap: 4px; }
+      .task-foot:empty { display: none; }
+    }
+
     /* ─── RECONNECT CHIP ───────────────────────────────────── */
     .auth-warn {
       position: fixed; left: 50%; transform: translateX(-50%) translateY(-8px);
@@ -756,7 +802,9 @@
       <div><kbd>⌘K</kbd> palette</div><div><kbd>N</kbd> new task</div>
       <div><kbd>↑</kbd><kbd>↓</kbd> move</div><div><kbd>Space</kbd> complete</div>
       <div><kbd>E</kbd> edit</div><div><kbd>D</kbd> set date</div>
-      <div><kbd>/</kbd> search</div><div><kbd>⌘Z</kbd> undo</div>
+      <div><kbd>U</kbd> urgent</div><div><kbd>T</kbd> today</div>
+      <div><kbd>M</kbd> tomorrow</div><div><kbd>/</kbd> search</div>
+      <div><kbd>⌘Z</kbd> undo</div><div><kbd>⌫</kbd> delete</div>
     </div>
   </div>
 </div>
@@ -1937,8 +1985,9 @@ function dayDiff(iso) {
   const a = new Date(y, m - 1, d, 12), b = new Date(); b.setHours(12, 0, 0, 0);
   return Math.round((a - b) / 86400000);
 }
-function isOverdue(iso) { return dayDiff(iso) < 0; }
-function isToday(iso)   { return dayDiff(iso) === 0; }
+function isOverdue(iso)  { return !!iso && dayDiff(iso) < 0; }
+function isToday(iso)    { return !!iso && dayDiff(iso) === 0; }
+function isTomorrow(iso) { return !!iso && dayDiff(iso) === 1; }
 const WEEKDAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 const MONTHS   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -2167,10 +2216,37 @@ function openDateMenu(btn, current, onPick) {
   openMenu(btn, items);
 }
 
-function setTaskDue(task, section, due) {
+/* ── QUICK FLAGS ─────────────────────────────────────────────
+   One tap on a card sends it to Urgent, Today or Tomorrow — and taps again to
+   take it back off. Urgent lives in the title (the file format has always
+   marked it with a 🚨 URGENT: prefix); today and tomorrow are just dates, so
+   they're mutually exclusive and the same button clears them. */
+function toggleUrgent(task, section) {
+  const on = isUrgent(task);
+  const bare = cleanTitle(task).trim();
+  const next = on ? bare : `🚨 URGENT: ${bare}`;
+  if (next === task.title) return;
+  renameExpandedKey(section, task.title, next);
+  if (selectedKey === section + '::' + task.title) selectedKey = section + '::' + next;
+  perform(on ? 'Urgent removed' : '🚨 Marked urgent',
+    [{ k: 'editTask', section, from: task.title, title: next, note: task.note || '', due: task.due || null }],
+    [{ k: 'editTask', section, from: next, title: task.title, note: task.note || '', due: task.due || null }],
+    { now: true });
+  haptic();
+}
+
+function toggleQuickDue(task, section, which) {
+  const target = which === 'today' ? todayStr(0) : todayStr(1);
+  const already = (task.due || null) === target;
+  haptic();
+  setTaskDue(task, section, already ? null : target,
+    already ? 'Date cleared' : `📅 ${which === 'today' ? 'Today' : 'Tomorrow'}`);
+}
+
+function setTaskDue(task, section, due, label) {
   const oldDue = task.due || null;
   if ((due || null) === oldDue) return;
-  perform(due ? `📅 ${dueLabel(due)}` : 'Date cleared',
+  perform(label || (due ? `📅 ${dueLabel(due)}` : 'Date cleared'),
     [{ k: 'editTask', section, from: task.title, title: task.title, note: task.note || '', due: due || null }],
     [{ k: 'editTask', section, from: task.title, title: task.title, note: task.note || '', due: oldDue }],
     { now: true });
@@ -2406,7 +2482,17 @@ function makeCard(task, section) {
       <div class="task-body">
         <div class="task-title ${task.checked ? 'done' : ''}">${esc(cleanTitle(task))}</div>
         ${task.note ? `<div class="task-note">${esc(task.note)}</div>` : ''}
-        ${metaHtml}
+        ${isDone ? metaHtml : `<div class="task-foot">
+          ${metaHtml}
+          <div class="flags" role="group" aria-label="Quick flags">
+            <button class="flag${urgent ? ' on urgent' : ''}" data-flag="urgent"
+                    type="button" title="Urgent (U)" aria-pressed="${urgent}">!</button>
+            <button class="flag${isToday(task.due) ? ' on' : ''}" data-flag="today"
+                    type="button" title="Due today (T)" aria-pressed="${isToday(task.due)}">☀</button>
+            <button class="flag${isTomorrow(task.due) ? ' on' : ''}" data-flag="tomorrow"
+                    type="button" title="Due tomorrow (M)" aria-pressed="${isTomorrow(task.due)}">➔</button>
+          </div>
+        </div>`}
       </div>
       <button class="more-btn" type="button" title="Edit, move or delete">⋯</button>
       ${showExpander ? `<div class="expand-btn ${expanded ? 'open' : ''}">›</div>` : ''}
@@ -2421,6 +2507,17 @@ function makeCard(task, section) {
   card.querySelector('.cb').addEventListener('click', e => {
     e.stopPropagation();
     toggleTask(task, section, card);
+  });
+
+  // Quick flags — urgent / today / tomorrow, one tap each
+  card.querySelectorAll('.flag').forEach(btn => {
+    btn.addEventListener('pointerdown', e => e.stopPropagation());
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const kind = btn.dataset.flag;
+      if (kind === 'urgent') toggleUrgent(task, section);
+      else toggleQuickDue(task, section, kind);
+    });
   });
 
   // ⋯ menu — edit, move, delete
@@ -2901,6 +2998,21 @@ document.addEventListener('keydown', e => {
       const s = selectedTask(); if (!s) return;
       e.preventDefault();
       openDateMenu(s.el.querySelector('.more-btn'), s.task.due, v => setTaskDue(s.task, s.section, v));
+      break;
+    }
+    case 'u': case 'U': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); toggleUrgent(s.task, s.section);
+      break;
+    }
+    case 't': case 'T': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); toggleQuickDue(s.task, s.section, 'today');
+      break;
+    }
+    case 'm': case 'M': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); toggleQuickDue(s.task, s.section, 'tomorrow');
       break;
     }
     case 'Enter': {
