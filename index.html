@@ -291,6 +291,54 @@
     body.dnd-dragging, body.dnd-dragging * { cursor: grabbing !important; }
     body.dnd-dragging { -webkit-user-select: none; user-select: none; }
 
+    /* ─── EDIT / MENU ──────────────────────────────────────── */
+    .more-btn {
+      flex-shrink: 0; align-self: center; cursor: pointer; opacity: 0;
+      color: var(--muted); font-size: 15px; line-height: 1;
+      padding: 3px 6px; border-radius: 6px; border: none; background: none;
+      letter-spacing: 1px; transition: opacity .15s, background .15s;
+    }
+    .task-card:hover .more-btn, .sub-item:hover .more-btn { opacity: .55; }
+    .more-btn:hover, .more-btn.open { opacity: 1 !important; background: var(--sidebar); }
+    @media (hover: none) { .more-btn { opacity: .4; } }
+    .sub-item .more-btn { font-size: 13px; padding: 2px 5px; }
+
+    .menu {
+      position: fixed; z-index: 10000; min-width: 176px;
+      background: var(--card, #fff); border: 1px solid var(--border);
+      border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.16);
+      padding: 5px; font-size: 13px; overflow: hidden;
+    }
+    .menu button {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      background: none; border: none; text-align: left; cursor: pointer;
+      font: inherit; color: var(--text); padding: 8px 10px; border-radius: 7px;
+    }
+    .menu button:hover { background: var(--sidebar); }
+    .menu button.danger { color: var(--urgent); }
+    .menu .menu-sep { height: 1px; background: var(--border-lt); margin: 4px 2px; }
+    .menu .menu-hd { font-size: 11px; font-weight: 700; letter-spacing: .04em;
+      text-transform: uppercase; color: var(--muted); padding: 7px 10px 4px; }
+    .menu-scroll { max-height: 232px; overflow-y: auto; }
+
+    /* Inline editor */
+    .edit-wrap { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+    .edit-in {
+      width: 100%; font: inherit; font-size: 14px; font-weight: 500; color: var(--text);
+      background: none; border: none; border-bottom: 1.5px solid var(--accent);
+      outline: none; padding: 2px 0;
+    }
+    .edit-in.note { font-size: 12px; font-weight: 400; color: var(--text2);
+      border-bottom-color: var(--border); }
+    .edit-actions { display: flex; gap: 6px; margin-top: 2px; }
+    .edit-actions button {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      border-radius: 6px; padding: 4px 11px; border: 1px solid var(--border);
+      background: none; color: var(--text2);
+    }
+    .edit-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .edit-hint { font-size: 11px; color: var(--muted); align-self: center; }
+
     /* ─── SYNC STATUS ──────────────────────────────────────── */
     .sync-dot {
       width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
@@ -779,6 +827,31 @@ function applyOp(model, op) {
       model.sections = [...moveable, ...fixed];
       return;
     }
+    case 'editTask': {
+      const t = findTask(model, op.section, op.from) || findTask(model, 'Completed', op.from);
+      if (!t) return;
+      t.title = op.title;
+      t.note  = op.note || '';
+      return;
+    }
+    case 'deleteTask': {
+      const arr = model.tasks[op.section] || [];
+      model.tasks[op.section] = arr.filter(t => t.title !== op.title);
+      return;
+    }
+    case 'editSub': {
+      const t = findTask(model, op.section, op.title);
+      if (!t) return;
+      const s = (t.subtasks || []).find(x => x.text === op.from);
+      if (s) s.text = op.text;
+      return;
+    }
+    case 'deleteSub': {
+      const t = findTask(model, op.section, op.title);
+      if (!t) return;
+      t.subtasks = (t.subtasks || []).filter(x => x.text !== op.text);
+      return;
+    }
   }
 }
 
@@ -814,6 +887,16 @@ function opSatisfied(model, op) {
     case 'uncompleteTask': return !done(op.title);
     case 'promoteSub':     return done(op.completedTitle);
     case 'moveTask':       return inSec(op.to, op.title);
+    case 'editTask':       return inSec(op.section, op.title) || done(op.title);
+    case 'deleteTask':     return !inSec(op.section, op.title);
+    case 'editSub': {
+      const t = findTask(model, op.section, op.title);
+      return !t || (t.subtasks || []).some(s => s.text === op.text);
+    }
+    case 'deleteSub': {
+      const t = findTask(model, op.section, op.title);
+      return !t || !(t.subtasks || []).some(s => s.text === op.text);
+    }
     default:               return true;   // ordering ops aren't worth healing
   }
 }
@@ -1166,6 +1249,163 @@ function getItems() {
   return items;
 }
 
+/* ── POPOVER MENU ────────────────────────────────────────────
+   One menu at a time, anchored under whatever ⋯ button opened it, flipped
+   above or nudged inwards when it would fall off screen. */
+let openMenuEl = null, openMenuBtn = null;
+
+function closeMenu() {
+  openMenuEl?.remove();
+  openMenuBtn?.classList.remove('open');
+  openMenuEl = null; openMenuBtn = null;
+}
+document.addEventListener('pointerdown', e => {
+  if (openMenuEl && !openMenuEl.contains(e.target) && e.target !== openMenuBtn) closeMenu();
+}, true);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenu(); });
+window.addEventListener('resize', closeMenu);
+document.getElementById('taskScroll')?.addEventListener('scroll', closeMenu, { passive: true });
+
+// items: [{label, onClick, danger}] | {header} | 'sep' | {scroll:[items]}
+function openMenu(btn, items) {
+  const wasMine = openMenuBtn === btn;
+  closeMenu();
+  if (wasMine) return;
+
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+
+  const addItem = (it, into) => {
+    if (it === 'sep') { const d = document.createElement('div'); d.className = 'menu-sep'; into.appendChild(d); return; }
+    if (it.header)    { const h = document.createElement('div'); h.className = 'menu-hd'; h.textContent = it.header; into.appendChild(h); return; }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = it.label;
+    if (it.danger) b.className = 'danger';
+    b.addEventListener('click', ev => { ev.stopPropagation(); closeMenu(); it.onClick(); });
+    into.appendChild(b);
+  };
+
+  items.forEach(it => {
+    if (it && it.scroll) {
+      const box = document.createElement('div');
+      box.className = 'menu-scroll';
+      it.scroll.forEach(sub => addItem(sub, box));
+      menu.appendChild(box);
+    } else addItem(it, menu);
+  });
+
+  document.body.appendChild(menu);
+  const r = btn.getBoundingClientRect();
+  const m = menu.getBoundingClientRect();
+  let top  = r.bottom + 6;
+  let left = r.right - m.width;
+  if (top + m.height > innerHeight - 8) top = Math.max(8, r.top - m.height - 6);
+  if (left < 8) left = 8;
+  if (left + m.width > innerWidth - 8) left = Math.max(8, innerWidth - 8 - m.width);
+  menu.style.top = top + 'px';
+  menu.style.left = left + 'px';
+
+  btn.classList.add('open');
+  openMenuEl = menu; openMenuBtn = btn;
+}
+
+/* ── EDIT / DELETE / MOVE ────────────────────────────────── */
+function renameExpandedKey(section, oldTitle, newTitle) {
+  if (expandedIds.delete(section + '::' + oldTitle)) expandedIds.add(section + '::' + newTitle);
+}
+
+function startEditTask(task, section, card) {
+  closeMenu();
+  const body = card.querySelector('.task-body');
+  if (!body || body.querySelector('.edit-wrap')) return;
+  const prevHTML = body.innerHTML;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'edit-wrap';
+  wrap.innerHTML = `
+    <input class="edit-in title" type="text" placeholder="Task">
+    <input class="edit-in note"  type="text" placeholder="Note (optional)">
+    <div class="edit-actions">
+      <button type="button" class="primary">Save</button>
+      <button type="button" class="cancel">Cancel</button>
+      <span class="edit-hint">Enter to save · Esc to cancel</span>
+    </div>`;
+  const titleIn = wrap.querySelector('.title');
+  const noteIn  = wrap.querySelector('.note');
+  titleIn.value = task.title;
+  noteIn.value  = task.note || '';
+
+  body.innerHTML = '';
+  body.appendChild(wrap);
+  body.style.cursor = 'default';
+  titleIn.focus(); titleIn.select();
+
+  let closed = false;
+  const cancel = () => { if (closed) return; closed = true; body.innerHTML = prevHTML; renderTasks(); };
+  const save = () => {
+    if (closed) return;
+    const newTitle = titleIn.value.trim();
+    const newNote  = noteIn.value.trim();
+    if (!newTitle) { titleIn.focus(); return; }
+    closed = true;
+    if (newTitle === task.title && newNote === (task.note || '')) { renderTasks(); return; }
+    const from = task.title;
+    renameExpandedKey(section, from, newTitle);
+    task.title = newTitle; task.note = newNote;
+    renderSidebar(); renderMobileTabs(); renderTasks();
+    commit({ k: 'editTask', section, from, title: newTitle, note: newNote }, { now: true });
+    toast('✎ Saved');
+  };
+
+  wrap.querySelector('.primary').addEventListener('click', e => { e.stopPropagation(); save(); });
+  wrap.querySelector('.cancel').addEventListener('click',  e => { e.stopPropagation(); cancel(); });
+  [titleIn, noteIn].forEach(el => {
+    el.addEventListener('click', e => e.stopPropagation());
+    el.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Enter')  { e.preventDefault(); save(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    });
+  });
+}
+
+function deleteTask(task, section) {
+  const arr = tasks[section] || [];
+  tasks[section] = arr.filter(t => t !== task);
+  expandedIds.delete(section + '::' + task.title);
+  renderSidebar(); renderMobileTabs(); renderTasks();
+  commit({ k: 'deleteTask', section, title: task.title }, { now: true });
+  toast('🗑 Deleted');
+}
+
+function moveTaskToSection(task, section, target) {
+  if (target === section) return;
+  tasks[section] = (tasks[section] || []).filter(t => t !== task);
+  if (!tasks[target]) { tasks[target] = []; if (!sections.includes(target)) sections.push(target); }
+  tasks[target].unshift(task);
+  if (target === 'Completed') task.checked = true;
+  else if (section === 'Completed') task.checked = false;
+  renderSidebar(); renderMobileTabs(); renderTasks();
+  commit({ k: 'moveTask', title: task.title, from: section, to: target, index: 0 }, { now: true });
+  toast(`→ ${target}`);
+}
+
+function taskMenu(btn, task, section, card) {
+  const others = sections.filter(s => s !== section && s !== 'Completed');
+  openMenu(btn, [
+    { label: '✎  Edit',        onClick: () => startEditTask(task, section, card) },
+    ...(others.length ? ['sep', { header: 'Move to' },
+        { scroll: others.map(s => ({ label: s, onClick: () => moveTaskToSection(task, section, s) })) }] : []),
+    'sep',
+    { label: '🗑  Delete', danger: true, onClick: () => {
+        openMenu(btn, [{ header: 'Delete this task?' },
+          { label: 'Yes, delete', danger: true, onClick: () => deleteTask(task, section) },
+          { label: 'Keep it', onClick: () => {} }]);
+      } },
+  ]);
+}
+
 // ── RENDER TASKS ─────────────────────────────────────────────
 function renderTasks() {
   const scroll = document.getElementById('taskScroll');
@@ -1236,6 +1476,7 @@ function makeCard(task, section) {
         ${task.note ? `<div class="task-note">${esc(task.note)}</div>` : ''}
         ${metaHtml}
       </div>
+      <button class="more-btn" type="button" title="Edit, move or delete">⋯</button>
       ${showExpander ? `<div class="expand-btn ${expanded ? 'open' : ''}">›</div>` : ''}
     </div>
     ${showExpander ? `
@@ -1250,6 +1491,15 @@ function makeCard(task, section) {
     toggleTask(task, section, card);
   });
 
+  // ⋯ menu — edit, move, delete
+  const moreBtn = card.querySelector('.more-btn');
+  moreBtn.addEventListener('click', e => { e.stopPropagation(); taskMenu(moreBtn, task, section, card); });
+  moreBtn.addEventListener('pointerdown', e => e.stopPropagation());
+  // Double-click the title goes straight to editing.
+  card.querySelector('.task-title').addEventListener('dblclick', e => {
+    e.stopPropagation(); startEditTask(task, section, card);
+  });
+
   // Expand subtasks (no re-render)
   if (showExpander) {
     const wrap = card.querySelector('.subs-wrap');
@@ -1257,6 +1507,7 @@ function makeCard(task, section) {
     const body = card.querySelector('.task-body');
     const toggle = e => {
       e.stopPropagation();
+      if (body.querySelector('.edit-wrap')) return;   // mid-edit, leave it alone
       const now = !expandedIds.has(cardKey);
       if (now) expandedIds.add(cardKey); else expandedIds.delete(cardKey);
       wrap.classList.toggle('open', now);
@@ -1286,7 +1537,57 @@ function buildSubtasks(container, task, section) {
       ${SUB_DH}
       <div class="sub-cb ${st.checked ? 'checked' : ''}"></div>
       <span class="sub-text ${st.checked ? 'done' : ''}">${esc(st.text)}</span>
+      <button class="more-btn" type="button" title="Edit or delete">⋯</button>
     `;
+
+    // Inline rename of a subtask.
+    const editSub = () => {
+      closeMenu();
+      const span = item.querySelector('.sub-text');
+      if (!span || item.querySelector('.sub-edit')) return;
+      const input = document.createElement('input');
+      input.className = 'edit-in sub-edit';
+      input.style.fontSize = '13px'; input.style.fontWeight = '400';
+      input.value = st.text;
+      span.replaceWith(input);
+      input.focus(); input.select();
+      let closed = false;
+      const finish = keep => {
+        if (closed) return; closed = true;
+        const text = input.value.trim();
+        if (keep && text && text !== st.text) {
+          const from = st.text;
+          st.text = text;
+          renderTasks();
+          commit({ k: 'editSub', section, title: task.title, from, text }, { now: true });
+          toast('✎ Saved');
+        } else renderTasks();
+      };
+      input.addEventListener('click', e => e.stopPropagation());
+      input.addEventListener('keydown', e => {
+        e.stopPropagation();
+        if (e.key === 'Enter')  { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+      });
+      input.addEventListener('blur', () => finish(true));
+    };
+    const removeSub = () => {
+      task.subtasks = (task.subtasks || []).filter(s => s !== st);
+      renderTasks();
+      commit({ k: 'deleteSub', section, title: task.title, text: st.text }, { now: true });
+      toast('🗑 Deleted');
+    };
+    const subMore = item.querySelector('.more-btn');
+    subMore.addEventListener('pointerdown', e => e.stopPropagation());
+    subMore.addEventListener('click', e => {
+      e.stopPropagation();
+      openMenu(subMore, [
+        { label: '✎  Edit', onClick: editSub },
+        'sep',
+        { label: '🗑  Delete', danger: true, onClick: removeSub },
+      ]);
+    });
+    item.querySelector('.sub-text').addEventListener('dblclick', e => { e.stopPropagation(); editSub(); });
     // Ticking a subtask promotes it into Completed as "(Parent) subtask".
     item.querySelector('.sub-cb').addEventListener('click', e => {
       e.stopPropagation();
