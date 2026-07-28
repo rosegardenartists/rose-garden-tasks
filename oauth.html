@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Signing in…</title>
+</head>
+<body>
+<!--
+  Google bounces the silent token renewal back here with the new token in the
+  URL fragment. This page's only job is to hand it to the app and disappear.
+  It never renders anything: the renewal happens in a hidden iframe.
+
+  For this to work, this exact URL must be listed as an Authorized redirect URI
+  on the OAuth client in Google Cloud Console:
+      https://rose-garden-pwa.vercel.app/oauth.html
+-->
+<script>
+  (function () {
+    var payload = { rg: 'oauth', hash: location.hash || '', search: location.search || '' };
+    try { (window.parent || window.opener).postMessage(payload, location.origin); } catch (e) {}
+    // If somebody lands here directly, don't leave them on a blank page.
+    if (window.parent === window && !window.opener) location.replace('/');
+  })();
+</script>
+</body>
+</html>

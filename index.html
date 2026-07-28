@@ -785,8 +785,15 @@
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────────
-let CLIENT_ID   = localStorage.getItem('rg_client_id') || '';
-let FILE_ID     = localStorage.getItem('rg_file_id')   || '1g-B5kDptp7VxDc9hclaQ9fXYCXIIMk_o';
+// localStorage throws in Safari private mode and inside cross-origin frames.
+// Never let a storage read take the app down.
+const store = {
+  get(k)    { try { return localStorage.getItem(k); } catch (_) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
+  del(k)    { try { localStorage.removeItem(k); } catch (_) {} },
+};
+let CLIENT_ID   = store.get('rg_client_id') || '';
+let FILE_ID     = store.get('rg_file_id')   || '1g-B5kDptp7VxDc9hclaQ9fXYCXIIMk_o';
 const SCOPES    = 'https://www.googleapis.com/auth/drive';
 let accessToken = null;
 let sections    = [];
@@ -805,8 +812,8 @@ window.addEventListener('load', async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
   if (!CLIENT_ID) { showPage('setupPage'); return; }
 
-  accessToken = localStorage.getItem('rg_access_token');
-  const cached = localStorage.getItem('rg_cache_md');
+  accessToken = store.get('rg_access_token');
+  const cached = store.get('rg_cache_md');
   const hasSignedInBefore = !!accessToken || !!cached;
 
   if (!hasSignedInBefore) { showPage('loginPage'); return; }
@@ -826,7 +833,8 @@ window.addEventListener('load', async () => {
   // 2. Quietly make sure the token is good, then pull the real thing.
   const ok = await ensureToken();
   if (!ok) {
-    setAuthWarn(true);
+    // Don't shout yet — a renewal is armed for his next tap. Only complain if
+    // there's nothing at all to show.
     if (!cached) showPage('loginPage');
     return;
   }
@@ -857,8 +865,8 @@ function saveSetup() {
   const fid = document.getElementById('fileIdInput').value.trim();
   if (!cid) { alert('Please enter your OAuth Client ID.'); return; }
   CLIENT_ID = cid; if (fid) FILE_ID = fid;
-  localStorage.setItem('rg_client_id', CLIENT_ID);
-  localStorage.setItem('rg_file_id', FILE_ID);
+  store.set('rg_client_id', CLIENT_ID);
+  store.set('rg_file_id', FILE_ID);
   showPage('loginPage');
 }
 
@@ -880,7 +888,7 @@ function saveSetup() {
    "Reconnect" chip on the same screen, not a bounce back to the login page.
    ══════════════════════════════════════════════════════════════ */
 let tokenClient  = null;
-let tokenExp     = Number(localStorage.getItem('rg_token_exp') || 0);
+let tokenExp     = Number(store.get('rg_token_exp') || 0);
 let tokenPromise = null;
 const EXP_MARGIN_MS = 5 * 60 * 1000;   // renew this long before it actually dies
 
@@ -892,8 +900,8 @@ function saveToken(resp) {
   accessToken = resp.access_token;
   const ttl = (Number(resp.expires_in) || 3600) * 1000;
   tokenExp = Date.now() + ttl;
-  localStorage.setItem('rg_access_token', accessToken);
-  localStorage.setItem('rg_token_exp', String(tokenExp));
+  store.set('rg_access_token', accessToken);
+  store.set('rg_token_exp', String(tokenExp));
   setAuthWarn(false);
   scheduleRenew();
 }
@@ -920,7 +928,93 @@ async function getTokenClient() {
   return tokenClient;
 }
 
-/* interactive:false = silent. Resolves true if we ended up with a live token. */
+/* Path 1 — genuinely invisible: a hidden iframe hitting Google's auth endpoint
+   with prompt=none. Google either bounces straight back to oauth.html with a
+   fresh token in the URL fragment, or refuses without showing anything.
+
+   This needs `<origin>/oauth.html` registered as an Authorized redirect URI in
+   the Google Cloud console. If it isn't, this quietly fails and we fall through
+   to path 2 — so the app works either way, it's just less seamless. */
+let SILENT_TIMEOUT_MS = 3500;   // a same-origin bounce is fast; don't stall the app
+function silentIframeRenew(timeout = SILENT_TIMEOUT_MS) {
+  return new Promise(resolve => {
+    let frame = null, done = false;
+    const redirect = location.origin + '/oauth.html';
+
+    const finish = ok => {
+      if (done) return; done = true;
+      clearTimeout(bail);
+      window.removeEventListener('message', onMsg);
+      try { frame?.remove(); } catch (_) {}
+      resolve(ok);
+    };
+    const onMsg = e => {
+      if (e.origin !== location.origin || !e.data || e.data.rg !== 'oauth') return;
+      const p = new URLSearchParams(String(e.data.hash || '').replace(/^#/, ''));
+      const token = p.get('access_token');
+      if (token) { saveToken({ access_token: token, expires_in: p.get('expires_in') }); finish(true); }
+      else finish(false);
+    };
+    const bail = setTimeout(() => finish(false), timeout);
+    window.addEventListener('message', onMsg);
+
+    const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    u.searchParams.set('client_id', CLIENT_ID);
+    u.searchParams.set('redirect_uri', redirect);
+    u.searchParams.set('response_type', 'token');
+    u.searchParams.set('scope', SCOPES);
+    u.searchParams.set('include_granted_scopes', 'true');
+    u.searchParams.set('prompt', 'none');
+    frame = document.createElement('iframe');
+    frame.style.cssText = 'position:fixed;left:-9999px;width:0;height:0;border:0';
+    frame.src = u.toString();
+    document.body.appendChild(frame);
+  });
+}
+
+/* Path 2 — Google's own token client. It opens a popup even when asked not to
+   prompt, and browsers only allow popups during a real click, so this can only
+   be used from inside a user gesture. With an active Google session the popup
+   opens and closes on its own; nothing is typed. */
+function popupRenew({ interactive = false } = {}) {
+  return (async () => {
+    try {
+      const client = await getTokenClient();
+      return await new Promise(resolve => {
+        const done = ok => { clearTimeout(bail); resolve(ok); };
+        const bail = setTimeout(() => done(false), interactive ? 120000 : 15000);
+        client.callback = resp => {
+          if (resp && resp.access_token) { saveToken(resp); done(true); } else done(false);
+        };
+        client.error_callback = () => done(false);
+        try { client.requestAccessToken({ prompt: interactive ? '' : '' }); }
+        catch (_) { done(false); }
+      });
+    } catch (_) { return false; }
+  })();
+}
+
+/* If we can't renew right now, renew on the very next thing he touches — a
+   click carries permission to open a popup. He taps something the moment he
+   opens the app anyway, so in practice this is invisible. */
+let gestureArmed = false;
+function renewOnNextGesture() {
+  if (gestureArmed) return;
+  gestureArmed = true;
+  const go = async () => {
+    document.removeEventListener('pointerdown', go, true);
+    document.removeEventListener('keydown', go, true);
+    gestureArmed = false;
+    const ok = await popupRenew();
+    if (ok) { setAuthWarn(false); loadTasks({ quiet: true }); flush(); }
+    else setAuthWarn(true);
+  };
+  document.addEventListener('pointerdown', go, true);
+  document.addEventListener('keydown', go, true);
+}
+
+/* interactive:true means he asked for it (tapped Reconnect), so a popup is
+   allowed and we can afford to wait for him. */
 async function ensureToken({ interactive = false, force = false } = {}) {
   if (!CLIENT_ID) { showPage('setupPage'); return false; }
   if (!force && tokenAlive()) return true;
@@ -928,19 +1022,10 @@ async function ensureToken({ interactive = false, force = false } = {}) {
 
   tokenPromise = (async () => {
     try {
-      const client = await getTokenClient();
-      return await new Promise(resolve => {
-        const done = ok => { clearTimeout(bail); resolve(ok); };
-        const bail = setTimeout(() => done(false), interactive ? 120000 : 12000);
-        client.callback = resp => {
-          if (resp && resp.access_token) { saveToken(resp); done(true); }
-          else done(false);
-        };
-        client.error_callback = () => done(false);
-        // '' asks Google to reuse the existing session with no UI.
-        try { client.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
-        catch (_) { done(false); }
-      });
+      if (interactive) return await popupRenew({ interactive: true });
+      if (await silentIframeRenew()) return true;     // invisible, if configured
+      renewOnNextGesture();                            // otherwise, on his next tap
+      return false;
     } catch (_) { return false; }
     finally { tokenPromise = null; }
   })();
@@ -985,9 +1070,9 @@ function signIn() { reconnect(); }
 
 function signOut() {
   if (accessToken) google.accounts.oauth2.revoke(accessToken, () => {});
-  localStorage.removeItem('rg_access_token');
-  localStorage.removeItem('rg_token_exp');
-  localStorage.removeItem('rg_cache_md');
+  store.del('rg_access_token');
+  store.del('rg_token_exp');
+  store.del('rg_cache_md');
   clearTimeout(renewTimer);
   accessToken = null; tokenExp = 0; sections = []; tasks = {};
   document.getElementById('settingsOv').classList.remove('open');
@@ -1001,7 +1086,7 @@ async function driveGet() {
   }));
   if (!r.ok) throw new Error('drive get ' + r.status);
   const text = await r.text();
-  try { localStorage.setItem('rg_cache_md', text); } catch (_) {}
+  try { store.set('rg_cache_md', text); } catch (_) {}
   return text;
 }
 // Tiny probe — a few hundred bytes — so we can poll often without pulling the
@@ -1104,9 +1189,9 @@ let flushing    = false;
 let syncState   = 'idle'; // idle | saving | offline
 const QUEUE_KEY = 'rg_pending_ops';
 
-try { queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); } catch (_) { queue = []; }
+try { queue = JSON.parse(store.get(QUEUE_KEY) || '[]'); } catch (_) { queue = []; }
 function persistQueue() {
-  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch (_) {}
+  try { store.set(QUEUE_KEY, JSON.stringify(queue)); } catch (_) {}
 }
 
 function setSync(s) {
@@ -1530,7 +1615,7 @@ async function loadTasks(opts = {}) {
     // If the spinner is still up and we have nothing to show, fall back to the
     // cached copy rather than an empty screen.
     if (!sections.length) {
-      const cached = localStorage.getItem('rg_cache_md');
+      const cached = store.get('rg_cache_md');
       if (cached) { const m = parseMd(cached); migrateCheckedSubtasks(m); adoptModel(m); }
       else document.getElementById('taskScroll').innerHTML = emptyState();
     }
@@ -2605,7 +2690,7 @@ document.getElementById('addUrgent').addEventListener('change', function() {
 
 // ── SETTINGS ────────────────────────────────────────────────
 function openSettings() {
-  document.getElementById('setEmail').textContent  = localStorage.getItem('rg_email') || 'Unknown';
+  document.getElementById('setEmail').textContent  = store.get('rg_email') || 'Unknown';
   document.getElementById('setFile').textContent   = FILE_ID;
   document.getElementById('setClient').textContent = CLIENT_ID.slice(0, 42) + '…';
   document.getElementById('settingsOv').classList.add('open');
@@ -2639,7 +2724,7 @@ function toast(msg, opts = {}) {
    Follows the system by default; the toggle in Settings pins it.
    ══════════════════════════════════════════════════════════════ */
 function applyTheme(pref) {
-  const mode = pref || localStorage.getItem('rg_theme') || 'auto';
+  const mode = pref || store.get('rg_theme') || 'auto';
   const dark = mode === 'dark' ||
     (mode === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
@@ -2648,9 +2733,9 @@ function applyTheme(pref) {
   if (lbl) lbl.textContent = mode === 'auto' ? 'Auto' : mode === 'dark' ? 'Dark' : 'Light';
 }
 function cycleTheme() {
-  const cur = localStorage.getItem('rg_theme') || 'auto';
+  const cur = store.get('rg_theme') || 'auto';
   const next = cur === 'auto' ? 'light' : cur === 'light' ? 'dark' : 'auto';
-  localStorage.setItem('rg_theme', next);
+  store.set('rg_theme', next);
   applyTheme(next);
   toast(`Theme: ${next}`);
 }
