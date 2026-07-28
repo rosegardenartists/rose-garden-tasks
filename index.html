@@ -380,6 +380,18 @@
       margin-bottom: 10px; appearance: none; transition: border-color .15s;
     }
     .sheet-in:focus, .sheet-sel:focus { border-color: var(--accent); }
+    .sheet-field { margin-bottom: 10px; }
+    .sheet-field .sheet-sel { margin-bottom: 0; }
+    .sheet-lbl {
+      display: block; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+      text-transform: uppercase; color: var(--muted); margin: 0 0 5px 2px;
+    }
+    /* the chevron on the selects */
+    .sheet-sel {
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='3'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 13px center; padding-right: 34px;
+    }
+    .sheet-sub-in { margin-top: -2px; }
     .sheet-urgent { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; color: var(--text2); margin-bottom: 12px; }
     .sheet-urgent input { width: 17px; height: 17px; cursor: pointer; accent-color: var(--urgent); }
     .sheet-sub { width: 100%; padding: 14px; background: var(--accent); color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background .15s; }
@@ -532,13 +544,25 @@
 <div class="sheet-bg" id="addSheet" onclick="onBgClick(event)">
   <div class="sheet">
     <div class="sheet-handle"></div>
-    <h3>New Task</h3>
+    <h3 id="addHeading">New Task</h3>
     <input type="text" class="sheet-in" id="addTitle" placeholder="What needs to be done?" autocomplete="off">
-    <select class="sheet-sel" id="addSection"></select>
+
+    <div class="sheet-field">
+      <label class="sheet-lbl" for="addSection">Section</label>
+      <select class="sheet-sel" id="addSection" onchange="onAddSectionChange()"></select>
+    </div>
+    <input type="text" class="sheet-in sheet-sub-in" id="addNewSection"
+           placeholder="New section name" autocomplete="off" style="display:none">
+
+    <div class="sheet-field" id="addParentField">
+      <label class="sheet-lbl" for="addParent">Add under</label>
+      <select class="sheet-sel" id="addParent" onchange="onAddParentChange()"></select>
+    </div>
+
     <label class="sheet-urgent" id="urgentLabel">
       <input type="checkbox" id="addUrgent"> Mark as urgent
     </label>
-    <button class="sheet-sub" onclick="submitAdd()">Add Task</button>
+    <button class="sheet-sub" id="addSubmitBtn" onclick="submitAdd()">Add Task</button>
   </div>
 </div>
 
@@ -852,6 +876,13 @@ function applyOp(model, op) {
       t.subtasks = (t.subtasks || []).filter(x => x.text !== op.text);
       return;
     }
+    case 'addSection': {
+      if (model.sections.includes(op.name)) return;
+      const at = model.sections.indexOf('Completed');
+      model.sections.splice(at === -1 ? model.sections.length : at, 0, op.name);
+      model.tasks[op.name] = model.tasks[op.name] || [];
+      return;
+    }
   }
 }
 
@@ -947,6 +978,7 @@ function opSatisfied(model, op) {
       const t = findTask(model, op.section, op.title);
       return !t || !(t.subtasks || []).some(s => s.text === op.text);
     }
+    case 'addSection':     return model.sections.includes(op.name);
     default:               return true;   // ordering ops aren't worth healing
   }
 }
@@ -1449,6 +1481,8 @@ function taskMenu(btn, task, section, card) {
   const others = sections.filter(s => s !== section && s !== 'Completed');
   openMenu(btn, [
     { label: '✎  Edit',        onClick: () => startEditTask(task, section, card) },
+    ...(section === 'Completed' ? [] : [
+      { label: '＋  Add subtask', onClick: () => openAdd({ section, parent: task.title }) }]),
     ...(others.length ? ['sep', { header: 'Move to' },
         { scroll: others.map(s => ({ label: s, onClick: () => moveTaskToSection(task, section, s) })) }] : []),
     'sep',
@@ -1731,15 +1765,63 @@ function toggleTask(task, section, cardEl) {
   }, 150);
 }
 
-// ── ADD TASK ────────────────────────────────────────────────
-function syncSectionSelect() {
+/* ── ADD TASK ────────────────────────────────────────────────
+   Three levels: a new section, a task inside a section, or a subtask under
+   an existing task. Pick the section, then optionally pick a parent task
+   under "Add under" and the new item lands as a subtask of it. */
+const NEW_SECTION = '__new_section__';
+
+function syncSectionSelect(preferred) {
   const sel = document.getElementById('addSection');
+  const want = preferred
+    || (sections.includes(sel.value) ? sel.value : null)
+    || (sections.includes(activeTab) && activeTab !== 'Completed' ? activeTab : null)
+    || sections.find(s => s !== 'Completed');
   sel.innerHTML = sections.filter(s => s !== 'Completed').map(s =>
-    `<option value="${s}" ${s === activeTab ? 'selected' : ''}>${s}</option>`
-  ).join('');
+    `<option value="${esc(s)}" ${s === want ? 'selected' : ''}>${esc(s)}</option>`
+  ).join('') + `<option value="${NEW_SECTION}">＋ New section…</option>`;
+  syncParentSelect();
 }
-function openAdd() {
-  syncSectionSelect();
+
+function syncParentSelect() {
+  const secSel  = document.getElementById('addSection');
+  const parSel  = document.getElementById('addParent');
+  const field   = document.getElementById('addParentField');
+  const section = secSel.value;
+
+  if (section === NEW_SECTION) { field.style.display = 'none'; parSel.innerHTML = ''; return; }
+  const open = (tasks[section] || []).filter(t => !t.checked);
+  field.style.display = open.length ? '' : 'none';
+  parSel.innerHTML = `<option value="">Nothing — add as its own task</option>` +
+    open.map(t => `<option value="${esc(t.title)}">${esc(cleanTitle(t))}</option>`).join('');
+  onAddParentChange();
+}
+
+function onAddSectionChange() {
+  const isNew = document.getElementById('addSection').value === NEW_SECTION;
+  const nameIn = document.getElementById('addNewSection');
+  nameIn.style.display = isNew ? '' : 'none';
+  if (isNew) { nameIn.value = ''; nameIn.focus(); }
+  syncParentSelect();
+}
+
+// A subtask is just a line of text — no note, no urgent flag — so hide the
+// urgent tickbox when one is being created, rather than lying about it.
+function onAddParentChange() {
+  const isSub = !!document.getElementById('addParent').value;
+  document.getElementById('urgentLabel').style.display = isSub ? 'none' : '';
+  document.getElementById('addHeading').textContent = isSub ? 'New Subtask' : 'New Task';
+  document.getElementById('addSubmitBtn').textContent = isSub ? 'Add Subtask' : 'Add Task';
+  document.getElementById('addTitle').placeholder = isSub ? 'What needs to be done?' : 'What needs to be done?';
+}
+
+function openAdd(opts = {}) {
+  syncSectionSelect(opts.section);
+  if (opts.parent) {
+    const parSel = document.getElementById('addParent');
+    if ([...parSel.options].some(o => o.value === opts.parent)) parSel.value = opts.parent;
+    onAddParentChange();
+  }
   document.getElementById('addSheet').classList.add('open');
   setTimeout(() => document.getElementById('addTitle').focus(), 200);
 }
@@ -1747,14 +1829,55 @@ function onBgClick(e) { if (e.target === document.getElementById('addSheet')) cl
 function closeAdd() {
   document.getElementById('addSheet').classList.remove('open');
   document.getElementById('addTitle').value = '';
+  document.getElementById('addNewSection').value = '';
+  document.getElementById('addNewSection').style.display = 'none';
   document.getElementById('addUrgent').checked = false;
   document.getElementById('urgentLabel').style.color = '';
+  document.getElementById('urgentLabel').style.display = '';
+  document.getElementById('addHeading').textContent = 'New Task';
+  document.getElementById('addSubmitBtn').textContent = 'Add Task';
 }
+
 function submitAdd() {
-  const title   = document.getElementById('addTitle').value.trim();
-  const section = document.getElementById('addSection').value;
+  const titleEl = document.getElementById('addTitle');
+  const title   = titleEl.value.trim();
+  let   section = document.getElementById('addSection').value;
+  const parent  = document.getElementById('addParent').value;
   const urgent  = document.getElementById('addUrgent').checked;
-  if (!title) { document.getElementById('addTitle').focus(); return; }
+  if (!title) { titleEl.focus(); return; }
+
+  // A brand-new section
+  if (section === NEW_SECTION) {
+    const nameEl = document.getElementById('addNewSection');
+    const name = nameEl.value.trim();
+    if (!name) { nameEl.focus(); return; }
+    if (name.toLowerCase() === 'completed') { nameEl.focus(); toast('That name is taken'); return; }
+    const existing = sections.find(s => s.toLowerCase() === name.toLowerCase());
+    section = existing || name;
+    if (!existing) {
+      const at = Math.max(0, sections.indexOf('Completed'));
+      sections.splice(sections.indexOf('Completed') === -1 ? sections.length : at, 0, section);
+      tasks[section] = [];
+      commit({ k: 'addSection', name: section });
+    }
+  }
+
+  if (parent) {
+    // Add as a subtask of an existing task
+    const p = (tasks[section] || []).find(t => t.title === parent);
+    if (!p) { toast('That task has moved — try again'); syncSectionSelect(section); return; }
+    if ((p.subtasks || []).some(s => s.text === title)) { closeAdd(); toast('Already there'); return; }
+    p.subtasks = p.subtasks || [];
+    p.subtasks.push({ text: title, checked: false });
+    expandedIds.add(section + '::' + p.title);
+    closeAdd();
+    if (!['All','🚨 Urgent','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
+    else { renderSidebar(); renderMobileTabs(); renderTasks(); }
+    toast(`＋ under ${cleanTitle(p)}`);
+    commit({ k: 'addSub', section, title: p.title, text: title }, { now: true });
+    return;
+  }
+
   const full = urgent ? `🚨 URGENT: ${title}` : title;
   if (!tasks[section]) tasks[section] = [];
   tasks[section].unshift({ title: full, note: '', checked: false, subtasks: [], _from: null });
@@ -1764,7 +1887,12 @@ function submitAdd() {
   toast(`Added to ${section}`);
   commit({ k: 'addTask', section, title: full, note: '' }, { now: true });
 }
+
 document.getElementById('addTitle').addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitAdd();
+  if (e.key === 'Escape') closeAdd();
+});
+document.getElementById('addNewSection').addEventListener('keydown', e => {
   if (e.key === 'Enter') submitAdd();
   if (e.key === 'Escape') closeAdd();
 });
