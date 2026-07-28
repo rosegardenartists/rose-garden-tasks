@@ -853,6 +853,9 @@ window.addEventListener('load', async () => {
 
   store.del(AUTH_TRY_KEY);
   scheduleRenew();
+  // A token that arrived via the redirect never went through saveToken, so make
+  // sure we know which account it belongs to — the next renewal depends on it.
+  rememberAccount();
   loadTasks({ quiet: !!cached });
 });
 
