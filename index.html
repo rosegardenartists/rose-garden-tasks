@@ -32,6 +32,32 @@
       --r-sm:      8px;
       --sw:        220px;
       --hh:        52px;
+      --shadow:    0 2px 8px rgba(0,0,0,.07);
+      --shadow-lg: 0 16px 48px rgba(0,0,0,.16);
+      --ring:      rgba(217,119,87,0.45);
+      --ease:      cubic-bezier(.22,.61,.36,1);
+    }
+
+    /* Dark mode. Warm, not blue-grey — it should still feel like the same app. */
+    :root[data-theme="dark"] {
+      --bg:        #16151a;
+      --sidebar:   #1d1c22;
+      --card:      #232128;
+      --text:      #ecebe8;
+      --text2:     #a8a6a1;
+      --muted:     #6f6d75;
+      --accent:    #e0876a;
+      --accent-dk: #cf7355;
+      --accent-lt: rgba(224,135,106,0.16);
+      --border:    #322f38;
+      --border-lt: #2a2830;
+      --urgent:    #f87171;
+      --urgent-bg: rgba(248,113,113,0.13);
+      --done:      #4ade80;
+      --shadow:    0 2px 10px rgba(0,0,0,.45);
+      --shadow-lg: 0 18px 52px rgba(0,0,0,.6);
+      --ring:      rgba(224,135,106,0.5);
+      color-scheme: dark;
     }
 
     html, body { height: 100%; }
@@ -41,6 +67,17 @@
       font-size: 14px; line-height: 1.5;
       overscroll-behavior: none;
       -webkit-font-smoothing: antialiased;
+      transition: background .2s var(--ease), color .2s var(--ease);
+    }
+
+    :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 6px; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
+    kbd {
+      font: inherit; font-size: 10px; font-weight: 600;
+      background: var(--sidebar); border: 1px solid var(--border);
+      border-radius: 4px; padding: 1px 5px; margin-right: 3px; color: var(--text2);
     }
 
     /* ─── AUTH ────────────────────────────────────────────── */
@@ -348,6 +385,116 @@
     .sync-dot.offline { background: var(--urgent); }
     @keyframes syncPulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
 
+    /* ─── DUE DATES ────────────────────────────────────────── */
+    .badge-d   { background: var(--accent-lt); color: var(--accent-dk); font-weight: 600; }
+    .badge-d.now { background: var(--accent); color: #fff; }
+    .badge-d.od  { background: var(--urgent-bg); color: var(--urgent); }
+    .badge-sec { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 500; }
+    .nav-badge.od { background: var(--urgent-bg); color: var(--urgent); }
+
+    .due-chip {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      background: none; border: 1px dashed var(--border); color: var(--muted);
+      border-radius: 8px; padding: 5px 10px; transition: all .15s var(--ease);
+    }
+    .due-chip:hover { border-color: var(--accent); color: var(--accent); }
+    .due-chip.set { border-style: solid; border-color: var(--accent); color: var(--accent); background: var(--accent-lt); }
+    .due-chip.overdue { border-color: var(--urgent); color: var(--urgent); background: var(--urgent-bg); }
+    .edit-due { margin-top: 2px; }
+    #addDueField { display: flex; align-items: center; gap: 10px; }
+    .add-hint { font-size: 12px; color: var(--accent); flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ─── SELECTION & MOTION ───────────────────────────────── */
+    .task-card { transition: box-shadow .15s var(--ease), opacity .2s var(--ease), transform .18s var(--ease), border-color .15s; }
+    .task-card.selected { box-shadow: 0 0 0 2px var(--ring); border-color: transparent; }
+    .task-card.vanishing { opacity: 0; transform: scale(.97); }
+    #taskScroll .task-card { animation: cardIn .18s var(--ease) both; }
+    @keyframes cardIn { from { opacity: 0; transform: translateY(4px) } to { opacity: 1; transform: none } }
+
+    /* ─── SWIPE ────────────────────────────────────────────── */
+    .task-card { position: relative; }
+    .task-card.swiping { transition: none; z-index: 2; }
+    .task-card::after {
+      content: ''; position: absolute; inset: 0; border-radius: inherit;
+      pointer-events: none; opacity: 0; transition: opacity .12s;
+      background: linear-gradient(90deg, var(--done) 0%, transparent 55%);
+    }
+    .task-card.swipe-done::after { opacity: .18; }
+    .task-card.swipe-menu::after { opacity: .18; background: linear-gradient(270deg, var(--muted) 0%, transparent 55%); }
+
+    /* ─── PULL TO REFRESH ──────────────────────────────────── */
+    .ptr { height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center;
+      transition: height .18s var(--ease); }
+    .ptr-spin { width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid var(--border); border-top-color: var(--accent); opacity: .5; }
+    .ptr.ready .ptr-spin { opacity: 1; }
+    .ptr.spin .ptr-spin { animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg) } }
+
+    /* ─── COMMAND PALETTE ──────────────────────────────────── */
+    .palette-ov {
+      position: fixed; inset: 0; z-index: 12000; display: none;
+      background: rgba(20,20,19,.42); backdrop-filter: blur(3px);
+      padding: 12vh 16px 16px; justify-content: center; align-items: flex-start;
+    }
+    .palette-ov.open { display: flex; animation: fadeIn .12s var(--ease); }
+    @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+    .palette {
+      width: 100%; max-width: 560px; background: var(--card);
+      border: 1px solid var(--border); border-radius: 14px;
+      box-shadow: var(--shadow-lg); overflow: hidden;
+      animation: palIn .16s var(--ease);
+    }
+    @keyframes palIn { from { opacity: 0; transform: translateY(-8px) scale(.985) } to { opacity: 1; transform: none } }
+    .pal-input {
+      width: 100%; border: none; border-bottom: 1px solid var(--border);
+      background: none; color: var(--text); font: inherit; font-size: 16px;
+      padding: 15px 17px; outline: none;
+    }
+    .pal-list { max-height: 46vh; overflow-y: auto; padding: 6px; }
+    .pal-row {
+      display: flex; align-items: center; gap: 10px; width: 100%;
+      background: none; border: none; cursor: pointer; font: inherit;
+      color: var(--text); text-align: left; padding: 9px 11px; border-radius: 8px;
+    }
+    .pal-row.on, .pal-row:hover { background: var(--accent-lt); }
+    .pal-icon { width: 18px; text-align: center; color: var(--muted); flex-shrink: 0; }
+    .pal-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pal-hint { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+    .pal-empty { padding: 22px; text-align: center; color: var(--muted); font-size: 13px; }
+    .pal-foot { display: flex; gap: 14px; padding: 9px 14px; border-top: 1px solid var(--border-lt);
+      font-size: 11px; color: var(--muted); }
+
+    /* ─── TOAST UNDO ───────────────────────────────────────── */
+    /* Overrides the base .toast below: it needs to be clickable now that it
+       carries an Undo button, and above the sheet backdrop. */
+    .toast {
+      display: flex; align-items: center; gap: 12px;
+      pointer-events: none; z-index: 11000;
+      bottom: calc(88px + env(safe-area-inset-bottom));
+    }
+    .toast.show { pointer-events: auto; }
+    .toast-btn {
+      font: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
+      background: none; border: none; color: var(--accent);
+      padding: 2px 2px; flex-shrink: 0;
+    }
+    :root[data-theme="dark"] .toast-btn { color: #ffb894; }
+
+    /* ─── SETTINGS KEYS ────────────────────────────────────── */
+    .s-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 14px;
+      margin-top: 22px; font-size: 12px; color: var(--text2); }
+    .s-keys-hd { grid-column: 1 / -1; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+
+    /* ─── SAFE AREAS (notch / home indicator) ──────────────── */
+    .m-hdr   { padding-top: max(0px, env(safe-area-inset-top)); }
+    .fab     { bottom: calc(24px + env(safe-area-inset-bottom)); }
+    .sheet   { padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
+    .task-scroll { padding-bottom: calc(90px + env(safe-area-inset-bottom)); }
+    .settings-inner { padding-top: max(20px, env(safe-area-inset-top)); }
+
     /* ─── FAB ──────────────────────────────────────────────── */
     .fab {
       position: fixed; bottom: 24px; right: 20px;
@@ -399,11 +546,12 @@
 
     /* ─── TOAST ────────────────────────────────────────────── */
     .toast {
-      position: fixed; bottom: 88px; left: 50%;
+      position: fixed; left: 50%;
       transform: translateX(-50%) translateY(6px);
-      background: #1a1917; color: white; padding: 8px 16px; border-radius: 20px;
-      font-size: 13px; font-weight: 500; z-index: 500; opacity: 0;
-      transition: opacity .2s, transform .2s; pointer-events: none; white-space: nowrap;
+      background: #1a1917; color: white; padding: 9px 10px 9px 16px; border-radius: 20px;
+      font-size: 13px; font-weight: 500; opacity: 0;
+      transition: opacity .2s, transform .2s; white-space: nowrap;
+      box-shadow: 0 8px 28px rgba(0,0,0,.3);
     }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
@@ -423,7 +571,8 @@
     /* ─── EMPTY / LOADING ──────────────────────────────────── */
     .empty-st { text-align: center; padding: 48px 20px; color: var(--muted); }
     .empty-st .icon { font-size: 32px; margin-bottom: 10px; }
-    .empty-st p { font-size: 14px; }
+    .empty-st p { font-size: 15px; font-weight: 600; color: var(--text2); }
+    .empty-st small { display: block; margin-top: 5px; font-size: 12.5px; color: var(--muted); }
     .load-st { display: flex; flex-direction: column; align-items: center; padding: 48px 20px; color: var(--muted); gap: 12px; }
     .spinner { width: 26px; height: 26px; border: 2.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -531,7 +680,8 @@
     <div class="m-tabs" id="mTabs"></div>
 
     <!-- Task list -->
-    <div class="task-scroll" id="taskScroll">
+    <div class="ptr" id="ptr" aria-hidden="true"><div class="ptr-spin"></div></div>
+    <div class="task-scroll" id="taskScroll" role="list">
       <div class="load-st"><div class="spinner"></div></div>
     </div>
   </div>
@@ -559,6 +709,11 @@
       <select class="sheet-sel" id="addParent" onchange="onAddParentChange()"></select>
     </div>
 
+    <div class="sheet-field" id="addDueField">
+      <button type="button" class="due-chip" id="addDueBtn">📅 Add date</button>
+      <span class="add-hint" id="addHint"></span>
+    </div>
+
     <label class="sheet-urgent" id="urgentLabel">
       <input type="checkbox" id="addUrgent"> Mark as urgent
     </label>
@@ -578,12 +733,34 @@
     <div class="s-row"><div class="s-lbl">File ID</div><div class="s-val mono" id="setFile">—</div></div>
     <div class="s-row"><div class="s-lbl">Client ID</div><div class="s-val mono" id="setClient">—</div></div>
     <button class="btn-ol" onclick="loadTasks();closeSettings()">↻ Sync Now</button>
+    <button class="btn-ol" onclick="cycleTheme()">🌓 Theme · <span id="themeLabel">Auto</span></button>
     <button class="btn-ol danger" onclick="signOut()">Sign Out</button>
+    <div class="s-keys">
+      <div class="s-keys-hd">Keyboard</div>
+      <div><kbd>⌘K</kbd> palette</div><div><kbd>N</kbd> new task</div>
+      <div><kbd>↑</kbd><kbd>↓</kbd> move</div><div><kbd>Space</kbd> complete</div>
+      <div><kbd>E</kbd> edit</div><div><kbd>D</kbd> set date</div>
+      <div><kbd>/</kbd> search</div><div><kbd>⌘Z</kbd> undo</div>
+    </div>
+  </div>
+</div>
+
+<!-- COMMAND PALETTE -->
+<div class="palette-ov" id="paletteOv">
+  <div class="palette" role="dialog" aria-label="Command palette">
+    <input type="text" id="paletteInput" class="pal-input" placeholder="Search tasks or type a command…"
+           autocomplete="off" spellcheck="false" aria-label="Search tasks or commands">
+    <div class="pal-list" id="paletteList"></div>
+    <div class="pal-foot">
+      <span><kbd>↑</kbd><kbd>↓</kbd> move</span>
+      <span><kbd>↵</kbd> open</span>
+      <span><kbd>esc</kbd> close</span>
+    </div>
   </div>
 </div>
 
 <!-- TOAST -->
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────────
@@ -701,10 +878,15 @@ function parseMd(md) {
       if (curTask) tsks[curSec].push(curTask);
       const checked = /\[[xX]\]/.test(line);
       let text = line.replace(/^- \[[ xX]\]\s*/, '');
+      // A trailing "@YYYY-MM-DD" is the due date. Lines without one are
+      // perfectly valid — everything written before dates existed still reads.
+      let due = null;
+      const d = text.match(/\s*@(\d{4}-\d{2}-\d{2})\s*$/);
+      if (d) { due = d[1]; text = text.slice(0, d.index); }
       let title = text, note = '';
       const b = text.match(/^\*\*(.+?)\*\*(.*)$/);
       if (b) { title = b[1]; note = b[2].replace(/^\s*-\s*/, '').trim(); }
-      curTask = { title, note, checked, subtasks: [], _from: null };
+      curTask = { title, note, due, checked, subtasks: [], _from: null };
       continue;
     }
     if (curTask && /^\s+- \[[ xX]\]/.test(line)) {
@@ -725,7 +907,8 @@ function toMarkdown(model) {
     md += `\n## ${sec}\n`;
     (m.tasks[sec] || []).forEach(t => {
       const note = t.note ? ` - ${t.note}` : '';
-      md += `- ${t.checked ? '[x]' : '[ ]'} **${t.title}**${note}\n`;
+      const due  = t.due ? ` @${t.due}` : '';
+      md += `- ${t.checked ? '[x]' : '[ ]'} **${t.title}**${note}${due}\n`;
       (t.subtasks || []).forEach(st => {
         md += `  - ${st.checked ? '[x]' : '[ ]'} ${st.text}\n`;
       });
@@ -782,12 +965,26 @@ function ensureSection(model, name) {
   return model.tasks[name];
 }
 
+function clone(x) { return JSON.parse(JSON.stringify(x)); }
+function newTask(title, note, due) {
+  return { title, note: note || '', due: due || null, checked: false, subtasks: [], _from: null };
+}
+
 function applyOp(model, op) {
   switch (op.k) {
     case 'addTask': {
       const arr = ensureSection(model, op.section);
       if (arr.some(t => t.title === op.title)) return;  // already there (replayed twice)
-      arr.unshift({ title: op.title, note: op.note || '', checked: false, subtasks: [], _from: null });
+      const t = newTask(op.title, op.note, op.due);
+      if (op.index == null) arr.unshift(t);
+      else arr.splice(Math.max(0, Math.min(arr.length, op.index)), 0, t);
+      return;
+    }
+    // Undo of a delete: puts the whole task back, subtasks and all, where it was.
+    case 'restoreTask': {
+      const arr = ensureSection(model, op.section);
+      if (arr.some(t => t.title === op.task.title)) return;
+      arr.splice(Math.max(0, Math.min(arr.length, op.index)), 0, clone(op.task));
       return;
     }
     case 'addSub': {
@@ -795,7 +992,8 @@ function applyOp(model, op) {
       if (!t) return;
       t.subtasks = t.subtasks || [];
       if (t.subtasks.some(s => s.text === op.text)) return;
-      t.subtasks.push({ text: op.text, checked: false });
+      if (op.index == null) t.subtasks.push({ text: op.text, checked: false });
+      else t.subtasks.splice(Math.max(0, Math.min(t.subtasks.length, op.index)), 0, { text: op.text, checked: false });
       return;
     }
     case 'completeTask': {
@@ -813,7 +1011,9 @@ function applyOp(model, op) {
       if (!t) return;
       model.tasks['Completed'] = arr.filter(x => x !== t);
       t.checked = false;
-      ensureSection(model, op.toSection).unshift(t);
+      const back = ensureSection(model, op.toSection);
+      if (op.index == null) back.unshift(t);
+      else back.splice(Math.max(0, Math.min(back.length, op.index)), 0, t);
       return;
     }
     case 'promoteSub': {
@@ -821,8 +1021,19 @@ function applyOp(model, op) {
       if (t) t.subtasks = (t.subtasks || []).filter(s => s.text !== op.subText);
       const done = ensureSection(model, 'Completed');
       if (!done.some(x => x.title === op.completedTitle)) {
-        done.unshift({ title: op.completedTitle, note: '', checked: true, subtasks: [], _from: op.section });
+        done.unshift({ title: op.completedTitle, note: '', due: null, checked: true, subtasks: [], _from: op.section });
       }
+      return;
+    }
+    // Undo of promoteSub: take it back out of Completed and re-attach it.
+    case 'demoteSub': {
+      model.tasks['Completed'] = (model.tasks['Completed'] || []).filter(x => x.title !== op.completedTitle);
+      const t = findTask(model, op.section, op.title);
+      if (!t) return;
+      t.subtasks = t.subtasks || [];
+      if (t.subtasks.some(s => s.text === op.subText)) return;
+      t.subtasks.splice(Math.max(0, Math.min(t.subtasks.length, op.index ?? t.subtasks.length)), 0,
+                        { text: op.subText, checked: false });
       return;
     }
     case 'moveTask': {
@@ -856,11 +1067,17 @@ function applyOp(model, op) {
       if (!t) return;
       t.title = op.title;
       t.note  = op.note || '';
+      if ('due' in op) t.due = op.due || null;
       return;
     }
     case 'deleteTask': {
       const arr = model.tasks[op.section] || [];
       model.tasks[op.section] = arr.filter(t => t.title !== op.title);
+      return;
+    }
+    case 'deleteSection': {
+      model.sections = model.sections.filter(s => s !== op.name);
+      delete model.tasks[op.name];
       return;
     }
     case 'editSub': {
@@ -979,6 +1196,12 @@ function opSatisfied(model, op) {
       return !t || !(t.subtasks || []).some(s => s.text === op.text);
     }
     case 'addSection':     return model.sections.includes(op.name);
+    case 'deleteSection':  return !model.sections.includes(op.name);
+    case 'restoreTask':    return inSec(op.section, op.task.title);
+    case 'demoteSub': {
+      const t = findTask(model, op.section, op.title);
+      return !t || (t.subtasks || []).some(s => s.text === op.subText);
+    }
     default:               return true;   // ordering ops aren't worth healing
   }
 }
@@ -992,6 +1215,54 @@ function findLostOps(model) {
   const lost = recentOps.filter(r => r.heals < MAX_HEALS && !opSatisfied(model, r.op));
   lost.forEach(r => r.heals++);
   return lost.map(r => r.op);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   ACTIONS & UNDO
+
+   Every change to the list goes through perform(). It takes the ops that make
+   the change and the ops that put things back, applies the forward ops, sends
+   them to Drive, and files the pair on the undo stack. Because undo is a real
+   inverse rather than a re-render from memory, it survives a sync landing in
+   between — and it works for deletes, which is where naive undo falls over.
+   ══════════════════════════════════════════════════════════════ */
+const undoStack = [], redoStack = [];
+const UNDO_LIMIT = 60;
+
+function renderAll() { renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect(); }
+
+function runOps(ops, opts = {}) {
+  ops.forEach(op => applyOp({ sections, tasks }, op));
+  renderAll();
+  ops.forEach(op => commit(op, opts));
+}
+
+// label: what the toast says. forward/inverse: arrays of ops.
+function perform(label, forward, inverse, opts = {}) {
+  runOps(forward, opts);
+  undoStack.push({ label, forward, inverse });
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  if (label) toast(label, { undo: true });
+  return true;
+}
+
+function undo() {
+  const entry = undoStack.pop();
+  if (!entry) { toast('Nothing to undo'); return false; }
+  runOps(entry.inverse, { now: true });
+  redoStack.push(entry);
+  toast(`Undid: ${entry.label || 'change'}`, { redo: true });
+  return true;
+}
+
+function redo() {
+  const entry = redoStack.pop();
+  if (!entry) { toast('Nothing to redo'); return false; }
+  runOps(entry.forward, { now: true });
+  undoStack.push(entry);
+  toast(entry.label || 'Redone', { undo: true });
+  return true;
 }
 
 // Every mutation goes through here: apply locally for an instant response,
@@ -1229,9 +1500,17 @@ function renderSidebar() {
   let html = '';
 
   // Static top items
-  [['All Tasks','All'],['🚨 Urgent','🚨 Urgent']].forEach(([lbl,tab]) => {
+  const todayN    = openTasks(t => t.due && dayDiff(t.due) <= 0).length;
+  const upcomingN = openTasks(t => t.due && dayDiff(t.due) > 0).length;
+  const urgentN   = openTasks(isUrgent).length;
+  const overdueN  = openTasks(t => t.due && isOverdue(t.due)).length;
+  [['All Tasks','All',null],
+   ['☀️ Today','Today',todayN],
+   ['📅 Upcoming','Upcoming',upcomingN],
+   ['🚨 Urgent','🚨 Urgent',urgentN]].forEach(([lbl,tab,n]) => {
     const a = tab === activeTab ? ' active' : '';
-    html += `<button class="nav-item${a}" onclick="setTab('${tab}')">${lbl}</button>`;
+    const badge = n ? `<span class="nav-badge${tab === 'Today' && overdueN ? ' od' : ''}">${n}</span>` : '';
+    html += `<button class="nav-item${a}" onclick="setTab('${tab.replace(/'/g,"\\'")}')">${lbl}${badge}</button>`;
   });
 
   html += '<div class="nav-divider">Sections</div>';
@@ -1260,7 +1539,7 @@ function renderSidebar() {
 // ── MOBILE TABS ──────────────────────────────────────────────
 function renderMobileTabs() {
   const bar = document.getElementById('mTabs');
-  const tabs = ['All', '🚨 Urgent', ...sections.filter(s => s !== 'Completed'), 'Completed'];
+  const tabs = ['All', 'Today', 'Upcoming', '🚨 Urgent', ...sections.filter(s => s !== 'Completed'), 'Completed'];
   bar.innerHTML = tabs.map(t =>
     `<button class="m-tab ${t === activeTab ? 'active' : ''}" onclick="setTab('${t.replace(/'/g,"\\'")}')">${t}</button>`
   ).join('');
@@ -1278,6 +1557,96 @@ function setTab(tab) {
 function onSearch(q) { searchQuery = q.toLowerCase(); renderTasks(); }
 
 // ── HELPERS ──────────────────────────────────────────────────
+/* ── DATES ───────────────────────────────────────────────────
+   Everything is a plain YYYY-MM-DD string in local time. No timezone maths,
+   no Date objects flying around — a due date is a calendar day, not an instant. */
+function todayStr(offset = 0) {
+  const d = new Date();
+  d.setHours(12, 0, 0, 0);
+  d.setDate(d.getDate() + offset);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function dayDiff(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const a = new Date(y, m - 1, d, 12), b = new Date(); b.setHours(12, 0, 0, 0);
+  return Math.round((a - b) / 86400000);
+}
+function isOverdue(iso) { return dayDiff(iso) < 0; }
+function isToday(iso)   { return dayDiff(iso) === 0; }
+const WEEKDAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const MONTHS   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function dueLabel(iso) {
+  if (!iso) return '';
+  const n = dayDiff(iso);
+  if (n === 0)  return 'Today';
+  if (n === 1)  return 'Tomorrow';
+  if (n === -1) return 'Yesterday';
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(y, m - 1, d, 12);
+  if (n < 0)   return `${Math.abs(n)} days ago`;
+  if (n < 7)   return WEEKDAYS[dt.getDay()];
+  const sameYear = dt.getFullYear() === new Date().getFullYear();
+  return `${MONTHS[dt.getMonth()]} ${dt.getDate()}${sameYear ? '' : ' ' + dt.getFullYear()}`;
+}
+
+/* Natural language in the title box: "call Preston friday", "pay rent tomorrow",
+   "renew passport aug 5". Returns the stripped title plus the date it found. */
+function parseWhen(raw) {
+  const patterns = [
+    [/\b(today|tonight)\b\s*$/i,                      () => todayStr(0)],
+    [/\b(tomorrow|tmrw|tmr)\b\s*$/i,                  () => todayStr(1)],
+    [/\bin (\d{1,3}) days?\b\s*$/i,                   m  => todayStr(parseInt(m[1]))],
+    [/\bin a week\b\s*$/i,                            () => todayStr(7)],
+    [/\bnext week\b\s*$/i,                            () => todayStr(7)],
+    [/\b(next\s+)?(sun|mon|tues?|wed(nes)?|thur?s?|fri|sat(ur)?)(day)?\b\s*$/i, m => {
+      const key = m[2].toLowerCase();
+      const idx = ['sun','mon','tue','wed','thu','fri','sat']
+        .findIndex(d => key.startsWith(d) || (key === 'tues' && d === 'tue') || (key === 'thur' && d === 'thu') || (key === 'thurs' && d === 'thu'));
+      if (idx < 0) return null;
+      const now = new Date(); now.setHours(12, 0, 0, 0);
+      let delta = (idx - now.getDay() + 7) % 7;
+      if (delta === 0) delta = 7;                    // "friday" on a Friday means next Friday
+      if (m[1]) delta += (delta <= 6 && m[1] ? 0 : 0);
+      return todayStr(delta);
+    }],
+    [/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(st|nd|rd|th)?\b\s*$/i, m => {
+      const mo = MONTHS.findIndex(x => x.toLowerCase() === m[1].slice(0, 3).toLowerCase());
+      const day = parseInt(m[2]);
+      if (mo < 0 || day < 1 || day > 31) return null;
+      const now = new Date();
+      let year = now.getFullYear();
+      const cand = new Date(year, mo, day, 12);
+      if (cand < new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12)) year++;
+      return `${year}-${String(mo + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }],
+    [/\b(\d{1,2})\/(\d{1,2})\b\s*$/, m => {
+      const mo = parseInt(m[1]) - 1, day = parseInt(m[2]);
+      if (mo < 0 || mo > 11 || day < 1 || day > 31) return null;
+      const now = new Date();
+      let year = now.getFullYear();
+      const cand = new Date(year, mo, day, 12);
+      if (cand < new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12)) year++;
+      return `${year}-${String(mo + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }],
+    [/\b(\d{4}-\d{2}-\d{2})\b\s*$/,                   m => m[1]],
+  ];
+  const text = String(raw || '');
+  for (const [re, fn] of patterns) {
+    const m = text.match(re);
+    if (!m) continue;
+    let due = null;
+    try { due = fn(m); } catch (_) { due = null; }
+    if (!due) continue;
+    const stripped = text.slice(0, m.index).replace(/[\s,·—–-]+$/, '').trim();
+    if (!stripped) continue;   // the whole thing was a date — keep it as the title
+    return { text: stripped, due };
+  }
+  return { text, due: null };
+}
+
+function haptic(ms = 8) { try { navigator.vibrate?.(ms); } catch (_) {} }
+
 function isUrgent(t) { return /urgent|🚨/i.test(t.title); }
 function cleanTitle(t) { return t.title.replace(/🚨\s*URGENT:\s*/i, '').replace(/URGENT:\s*/i, ''); }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -1310,16 +1679,24 @@ function migrateCheckedSubtasks(model) {
   return moved;
 }
 
+function openTasks(fn) {
+  const out = [];
+  sections.filter(s => s !== 'Completed').forEach(s =>
+    (tasks[s] || []).filter(t => !t.checked && fn(t)).forEach(t => out.push({ sec: s, task: t })));
+  return out;
+}
+
 function getItems() {
   let items = [];
   if (activeTab === 'All') {
-    sections.filter(s => s !== 'Completed').forEach(s =>
-      (tasks[s]||[]).filter(t => !t.checked).forEach(t => items.push({ sec: s, task: t }))
-    );
+    items = openTasks(() => true);
   } else if (activeTab === '🚨 Urgent') {
-    sections.filter(s => s !== 'Completed').forEach(s =>
-      (tasks[s]||[]).filter(t => !t.checked && isUrgent(t)).forEach(t => items.push({ sec: s, task: t }))
-    );
+    items = openTasks(isUrgent);
+  } else if (activeTab === 'Today') {
+    items = openTasks(t => t.due && dayDiff(t.due) <= 0)
+      .sort((a, b) => a.task.due.localeCompare(b.task.due));
+  } else if (activeTab === 'Upcoming') {
+    items = openTasks(t => t.due).sort((a, b) => a.task.due.localeCompare(b.task.due));
   } else if (activeTab === 'Completed') {
     (tasks['Completed']||[]).forEach(t => items.push({ sec: 'Completed', task: t }));
   } else {
@@ -1396,6 +1773,43 @@ function openMenu(btn, items) {
   openMenuEl = menu; openMenuBtn = btn;
 }
 
+/* ── DATE PICKER ─────────────────────────────────────────── */
+function openDateMenu(btn, current, onPick) {
+  const nextWeekday = (target) => {
+    const now = new Date(); now.setHours(12,0,0,0);
+    let d = (target - now.getDay() + 7) % 7; if (d === 0) d = 7;
+    return todayStr(d);
+  };
+  const items = [
+    { header: 'Due' },
+    { label: `Today · ${dueLabel(todayStr(0))}`,      onClick: () => onPick(todayStr(0)) },
+    { label: `Tomorrow · ${dueLabel(todayStr(1))}`,   onClick: () => onPick(todayStr(1)) },
+    { label: `This weekend · ${dueLabel(nextWeekday(6))}`, onClick: () => onPick(nextWeekday(6)) },
+    { label: `Next week · ${dueLabel(todayStr(7))}`,  onClick: () => onPick(todayStr(7)) },
+    'sep',
+    { label: '📆  Pick a date…', onClick: () => {
+        const inp = document.createElement('input');
+        inp.type = 'date'; inp.value = current || todayStr(0);
+        Object.assign(inp.style, { position: 'fixed', left: '-9999px' });
+        document.body.appendChild(inp);
+        inp.addEventListener('change', () => { if (inp.value) onPick(inp.value); inp.remove(); });
+        inp.addEventListener('blur',   () => setTimeout(() => inp.remove(), 300));
+        inp.showPicker ? inp.showPicker() : inp.click();
+      } },
+  ];
+  if (current) items.push('sep', { label: '✕  No date', danger: true, onClick: () => onPick(null) });
+  openMenu(btn, items);
+}
+
+function setTaskDue(task, section, due) {
+  const oldDue = task.due || null;
+  if ((due || null) === oldDue) return;
+  perform(due ? `📅 ${dueLabel(due)}` : 'Date cleared',
+    [{ k: 'editTask', section, from: task.title, title: task.title, note: task.note || '', due: due || null }],
+    [{ k: 'editTask', section, from: task.title, title: task.title, note: task.note || '', due: oldDue }],
+    { now: true });
+}
+
 /* ── EDIT / DELETE / MOVE ────────────────────────────────── */
 function renameExpandedKey(section, oldTitle, newTitle) {
   if (expandedIds.delete(section + '::' + oldTitle)) expandedIds.add(section + '::' + newTitle);
@@ -1412,6 +1826,7 @@ function startEditTask(task, section, card) {
   wrap.innerHTML = `
     <input class="edit-in title" type="text" placeholder="Task">
     <input class="edit-in note"  type="text" placeholder="Note (optional)">
+    <div class="edit-due"><button type="button" class="due-chip">📅 Add date</button></div>
     <div class="edit-actions">
       <button type="button" class="primary">Save</button>
       <button type="button" class="cancel">Cancel</button>
@@ -1433,15 +1848,16 @@ function startEditTask(task, section, card) {
     if (closed) return;
     const newTitle = titleIn.value.trim();
     const newNote  = noteIn.value.trim();
+    const newDue   = dueVal || null;
     if (!newTitle) { titleIn.focus(); return; }
     closed = true;
-    if (newTitle === task.title && newNote === (task.note || '')) { renderTasks(); return; }
-    const from = task.title;
-    renameExpandedKey(section, from, newTitle);
-    task.title = newTitle; task.note = newNote;
-    renderSidebar(); renderMobileTabs(); renderTasks();
-    commit({ k: 'editTask', section, from, title: newTitle, note: newNote }, { now: true });
-    toast('✎ Saved');
+    const oldTitle = task.title, oldNote = task.note || '', oldDue = task.due || null;
+    if (newTitle === oldTitle && newNote === oldNote && newDue === oldDue) { renderTasks(); return; }
+    renameExpandedKey(section, oldTitle, newTitle);
+    perform('✎ Saved',
+      [{ k: 'editTask', section, from: oldTitle, title: newTitle, note: newNote, due: newDue }],
+      [{ k: 'editTask', section, from: newTitle, title: oldTitle, note: oldNote, due: oldDue }],
+      { now: true });
   };
 
   wrap.querySelector('.primary').addEventListener('click', e => { e.stopPropagation(); save(); });
@@ -1454,27 +1870,41 @@ function startEditTask(task, section, card) {
       if (e.key === 'Escape') { e.preventDefault(); cancel(); }
     });
   });
+
+  // ── due date row ──
+  let dueVal = task.due || null;
+  const dueRow = wrap.querySelector('.edit-due');
+  const dueBtn = dueRow.querySelector('.due-chip');
+  const paint = () => {
+    dueBtn.textContent = dueVal ? '📅 ' + dueLabel(dueVal) : '📅 Add date';
+    dueBtn.classList.toggle('set', !!dueVal);
+    dueBtn.classList.toggle('overdue', !!dueVal && isOverdue(dueVal));
+  };
+  paint();
+  dueBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    openDateMenu(dueBtn, dueVal, v => { dueVal = v; paint(); titleIn.focus(); });
+  });
 }
 
 function deleteTask(task, section) {
-  const arr = tasks[section] || [];
-  tasks[section] = arr.filter(t => t !== task);
+  const index = (tasks[section] || []).indexOf(task);
+  if (index < 0) return;
+  const snapshot = clone(task);
   expandedIds.delete(section + '::' + task.title);
-  renderSidebar(); renderMobileTabs(); renderTasks();
-  commit({ k: 'deleteTask', section, title: task.title }, { now: true });
-  toast('🗑 Deleted');
+  perform('🗑 Deleted',
+    [{ k: 'deleteTask', section, title: task.title }],
+    [{ k: 'restoreTask', section, index, task: snapshot }],
+    { now: true });
 }
 
 function moveTaskToSection(task, section, target) {
   if (target === section) return;
-  tasks[section] = (tasks[section] || []).filter(t => t !== task);
-  if (!tasks[target]) { tasks[target] = []; if (!sections.includes(target)) sections.push(target); }
-  tasks[target].unshift(task);
-  if (target === 'Completed') task.checked = true;
-  else if (section === 'Completed') task.checked = false;
-  renderSidebar(); renderMobileTabs(); renderTasks();
-  commit({ k: 'moveTask', title: task.title, from: section, to: target, index: 0 }, { now: true });
-  toast(`→ ${target}`);
+  const index = (tasks[section] || []).indexOf(task);
+  perform(`→ ${target}`,
+    [{ k: 'moveTask', title: task.title, from: section, to: target, index: 0 }],
+    [{ k: 'moveTask', title: task.title, from: target, to: section, index: Math.max(0, index) }],
+    { now: true });
 }
 
 function taskMenu(btn, task, section, card) {
@@ -1482,6 +1912,8 @@ function taskMenu(btn, task, section, card) {
   openMenu(btn, [
     { label: '✎  Edit',        onClick: () => startEditTask(task, section, card) },
     ...(section === 'Completed' ? [] : [
+      { label: task.due ? `📅  ${dueLabel(task.due)}` : '📅  Set a date',
+        onClick: () => openDateMenu(btn, task.due, v => setTaskDue(task, section, v)) },
       { label: '＋  Add subtask', onClick: () => openAdd({ section, parent: task.title }) }]),
     ...(others.length ? ['sep', { header: 'Move to' },
         { scroll: others.map(s => ({ label: s, onClick: () => moveTaskToSection(task, section, s) })) }] : []),
@@ -1502,28 +1934,55 @@ function renderTasks() {
 
   const items = getItems();
   if (!items.length) {
-    scroll.innerHTML = `<div class="empty-st"><div class="icon">${searchQuery ? '🔍' : '✅'}</div><p>${searchQuery ? 'No matches.' : 'Nothing here!'}</p></div>`;
+    scroll.innerHTML = emptyState();
     return;
   }
 
-  const isGrouped = ['All', '🚨 Urgent'].includes(activeTab);
-  if (isGrouped) {
-    const bySec = {};
-    items.forEach(({ sec, task }) => { if (!bySec[sec]) bySec[sec] = []; bySec[sec].push({ task, sec }); });
-    Object.entries(bySec).forEach(([sec, its]) => {
+  const group = (keyOf, labelOf) => {
+    const buckets = new Map();
+    items.forEach(it => {
+      const k = keyOf(it);
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push(it);
+    });
+    buckets.forEach((its, k) => {
       const g = document.createElement('div'); g.className = 'sec-group';
       const lbl = document.createElement('div'); lbl.className = 'sec-label';
-      const open = its.filter(({task:t}) => !t.checked).length;
-      lbl.innerHTML = `${sec}<span class="sec-count">${open}</span>`;
+      lbl.innerHTML = `${esc(labelOf(k, its))}<span class="sec-count">${its.length}</span>`;
       g.appendChild(lbl);
       its.forEach(({ task, sec }) => g.appendChild(makeCard(task, sec)));
       scroll.appendChild(g);
     });
+  };
+
+  if (activeTab === 'Upcoming') {
+    group(it => {
+      const n = dayDiff(it.task.due);
+      return n < 0 ? 'overdue' : n <= 7 ? it.task.due : 'later';
+    }, k => k === 'overdue' ? 'Overdue' : k === 'later' ? 'Later' : dueLabel(k));
+  } else if (activeTab === 'Today') {
+    group(it => (isOverdue(it.task.due) ? 'overdue' : 'today'),
+          k => k === 'overdue' ? 'Overdue' : 'Today');
+  } else if (['All', '🚨 Urgent'].includes(activeTab)) {
+    group(it => it.sec, k => k);
   } else {
     items.forEach(({ task, sec }) => scroll.appendChild(makeCard(task, sec)));
   }
 
   scroll.scrollTop = savedTop; // restore scroll!
+  if (selectedKey) highlightSelected();
+}
+
+function emptyState() {
+  const states = {
+    'Today':     ['🌤', 'Nothing due today', 'Enjoy it — or pull something forward from Upcoming.'],
+    'Upcoming':  ['📅', 'Nothing scheduled', 'Add a date to a task and it will show up here.'],
+    'Completed': ['✅', 'Nothing finished yet', 'Ticked-off tasks collect here.'],
+    '🚨 Urgent': ['🎉', 'Nothing urgent', 'Everything that matters is under control.'],
+  };
+  if (searchQuery) return `<div class="empty-st"><div class="icon">🔍</div><p>No matches for “${esc(searchQuery)}”</p><small>Try a shorter word.</small></div>`;
+  const [icon, head, sub] = states[activeTab] || ['✅', 'All clear', 'Press N to add something.'];
+  return `<div class="empty-st"><div class="icon">${icon}</div><p>${head}</p><small>${sub}</small></div>`;
 }
 
 // ── MAKE CARD ────────────────────────────────────────────────
@@ -1543,12 +2002,22 @@ function makeCard(task, section) {
   card.setAttribute('data-dnd-type', 'task');
   card.setAttribute('data-dnd-sec', section);
   card.setAttribute('data-dnd-idx', idx);
+  card.setAttribute('data-key', task.title);
+  card.setAttribute('role', 'listitem');
+  if (selectedKey === section + '::' + task.title) card.classList.add('selected');
 
   const isDone = section === 'Completed' || task.checked;
-  const metaHtml = (urgent || hasSubs) ? `
+  const showSec = ['All','🚨 Urgent'].includes(activeTab) ? '' : '';
+  const dueBadge = task.due && !isDone
+    ? `<span class="badge badge-d${isOverdue(task.due) ? ' od' : isToday(task.due) ? ' now' : ''}">${esc(dueLabel(task.due))}</span>` : '';
+  const secBadge = ['Today','Upcoming'].includes(activeTab)
+    ? `<span class="badge badge-sec">${esc(section)}</span>` : '';
+  const metaHtml = (urgent || hasSubs || dueBadge || secBadge) ? `
     <div class="task-meta">
+      ${dueBadge}
       ${urgent ? '<span class="badge badge-u">🚨 Urgent</span>' : ''}
       ${hasSubs ? `<span class="badge badge-s">${task.subtasks.length}</span>` : ''}
+      ${secBadge}
     </div>` : '';
 
   // The chevron is always present on open tasks so a subtask can be added to
@@ -1608,8 +2077,14 @@ function makeCard(task, section) {
     buildSubtasks(card.querySelector('.subs-list'), task, section);
   }
 
-  // Drag-and-drop
+  // Drag-and-drop, and swipe on touch devices
   makeDraggable(card, 'task', { task, section, index: idx }, '.dh');
+  attachSwipe(card, task, section);
+
+  card.addEventListener('pointerdown', () => {
+    const k = section + '::' + task.title;
+    if (selectedKey !== k) { selectedKey = k; highlightSelected(); }
+  });
 
   return card;
 }
@@ -1645,10 +2120,10 @@ function buildSubtasks(container, task, section) {
         const text = input.value.trim();
         if (keep && text && text !== st.text) {
           const from = st.text;
-          st.text = text;
-          renderTasks();
-          commit({ k: 'editSub', section, title: task.title, from, text }, { now: true });
-          toast('✎ Saved');
+          perform('✎ Saved',
+            [{ k: 'editSub', section, title: task.title, from,      text }],
+            [{ k: 'editSub', section, title: task.title, from: text, text: from }],
+            { now: true });
         } else renderTasks();
       };
       input.addEventListener('click', e => e.stopPropagation());
@@ -1660,10 +2135,11 @@ function buildSubtasks(container, task, section) {
       input.addEventListener('blur', () => finish(true));
     };
     const removeSub = () => {
-      task.subtasks = (task.subtasks || []).filter(s => s !== st);
-      renderTasks();
-      commit({ k: 'deleteSub', section, title: task.title, text: st.text }, { now: true });
-      toast('🗑 Deleted');
+      const at = (task.subtasks || []).indexOf(st);
+      perform('🗑 Deleted',
+        [{ k: 'deleteSub', section, title: task.title, text: st.text }],
+        [{ k: 'addSub',    section, title: task.title, text: st.text, index: at }],
+        { now: true });
     };
     const subMore = item.querySelector('.more-btn');
     subMore.addEventListener('pointerdown', e => e.stopPropagation());
@@ -1686,10 +2162,10 @@ function buildSubtasks(container, task, section) {
       setTimeout(() => {
         expandedIds.add(section + '::' + task.title);
         const completedTitle = completedTitleFor(task, st.text);
-        promoteSubtask({ sections, tasks }, task, section, st);
-        renderSidebar(); renderMobileTabs(); renderTasks();
-        toast('✅ Moved to Completed');
-        commit({ k: 'promoteSub', section, title: task.title, subText: st.text, completedTitle });
+        const at = (task.subtasks || []).indexOf(st);
+        perform('✅ Moved to Completed',
+          [{ k: 'promoteSub', section, title: task.title, subText: st.text, completedTitle }],
+          [{ k: 'demoteSub',  section, title: task.title, subText: st.text, completedTitle, index: at }]);
       }, 150);
     });
     makeDraggable(item, 'subtask', { task, index: i }, '.sub-dh');
@@ -1714,13 +2190,13 @@ function buildSubtasks(container, task, section) {
   const saveSubtask = keepOpen => {
     const text = input.value.trim();
     if (!text) { add.classList.remove('editing'); return; }
-    task.subtasks = task.subtasks || [];
-    task.subtasks.push({ text, checked: false });
     input.value = '';
     expandedIds.add(section + '::' + task.title);
     // Re-render straight away so the new subtask shows up without a refresh.
-    renderSidebar(); renderMobileTabs(); renderTasks();
-    commit({ k: 'addSub', section, title: task.title, text }, { now: true });
+    perform('',
+      [{ k: 'addSub',    section, title: task.title, text }],
+      [{ k: 'deleteSub', section, title: task.title, text }],
+      { now: true });
     if (keepOpen) {
       const card = document.querySelector(`.task-card[data-dnd-sec="${CSS.escape(section)}"][data-dnd-idx="${(tasks[section]||[]).indexOf(task)}"]`);
       const nextInput = card?.querySelector('.sub-add-input');
@@ -1742,27 +2218,22 @@ function buildSubtasks(container, task, section) {
 
 // ── TOGGLE TASK ──────────────────────────────────────────────
 function toggleTask(task, section, cardEl) {
-  cardEl.style.transition = 'opacity .15s';
-  cardEl.style.opacity = '0.25';
+  haptic();
+  if (cardEl) { cardEl.classList.add('vanishing'); }
+  const wasDone = !!task.checked;
+  const index   = (tasks[section] || []).indexOf(task);
+  const back    = task._from || section;
   setTimeout(() => {
-    task.checked = !task.checked;
-    if (task.checked) {
-      tasks[section] = (tasks[section]||[]).filter(t => t !== task);
-      task._from = section;
-      if (!tasks['Completed']) { if (!sections.includes('Completed')) sections.push('Completed'); tasks['Completed'] = []; }
-      tasks['Completed'].unshift(task);
+    if (wasDone) {
+      perform('↩ Moved back',
+        [{ k: 'uncompleteTask', title: task.title, toSection: back, index: 0 }],
+        [{ k: 'completeTask',   section: back, title: task.title }]);
     } else {
-      tasks['Completed'] = (tasks['Completed']||[]).filter(t => t !== task);
-      const back = task._from || section;
-      if (!tasks[back]) tasks[back] = [];
-      tasks[back].unshift(task);
+      perform('✅ Moved to Completed',
+        [{ k: 'completeTask',   section, title: task.title }],
+        [{ k: 'uncompleteTask', title: task.title, toSection: section, index: Math.max(0, index) }]);
     }
-    renderSidebar(); renderMobileTabs(); renderTasks();
-    toast(task.checked ? '✅ Moved to Completed' : '↩ Moved back');
-    commit(task.checked
-      ? { k: 'completeTask',   section, title: task.title }
-      : { k: 'uncompleteTask', title: task.title, toSection: task._from || section });
-  }, 150);
+  }, 160);
 }
 
 /* ── ADD TASK ────────────────────────────────────────────────
@@ -1816,6 +2287,9 @@ function onAddParentChange() {
 }
 
 function openAdd(opts = {}) {
+  pendingAddDue = opts.due || (activeTab === 'Today' ? todayStr(0) : null);
+  paintAddDue();
+  document.getElementById('addHint').textContent = '';
   syncSectionSelect(opts.section);
   if (opts.parent) {
     const parSel = document.getElementById('addParent');
@@ -1829,6 +2303,8 @@ function onBgClick(e) { if (e.target === document.getElementById('addSheet')) cl
 function closeAdd() {
   document.getElementById('addSheet').classList.remove('open');
   document.getElementById('addTitle').value = '';
+  document.getElementById('addHint').textContent = '';
+  pendingAddDue = null; paintAddDue();
   document.getElementById('addNewSection').value = '';
   document.getElementById('addNewSection').style.display = 'none';
   document.getElementById('addUrgent').checked = false;
@@ -1854,38 +2330,36 @@ function submitAdd() {
     if (name.toLowerCase() === 'completed') { nameEl.focus(); toast('That name is taken'); return; }
     const existing = sections.find(s => s.toLowerCase() === name.toLowerCase());
     section = existing || name;
-    if (!existing) {
-      const at = Math.max(0, sections.indexOf('Completed'));
-      sections.splice(sections.indexOf('Completed') === -1 ? sections.length : at, 0, section);
-      tasks[section] = [];
-      commit({ k: 'addSection', name: section });
-    }
+    if (!existing) runOps([{ k: 'addSection', name: section }]);
   }
+
+  // "call Preston friday" → title "call Preston", due Friday
+  const parsed = parseWhen(title);
+  const cleanText = parsed.text || title;
 
   if (parent) {
     // Add as a subtask of an existing task
     const p = (tasks[section] || []).find(t => t.title === parent);
     if (!p) { toast('That task has moved — try again'); syncSectionSelect(section); return; }
     if ((p.subtasks || []).some(s => s.text === title)) { closeAdd(); toast('Already there'); return; }
-    p.subtasks = p.subtasks || [];
-    p.subtasks.push({ text: title, checked: false });
     expandedIds.add(section + '::' + p.title);
     closeAdd();
-    if (!['All','🚨 Urgent','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
-    else { renderSidebar(); renderMobileTabs(); renderTasks(); }
-    toast(`＋ under ${cleanTitle(p)}`);
-    commit({ k: 'addSub', section, title: p.title, text: title }, { now: true });
+    if (!['All','🚨 Urgent','Today','Upcoming','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
+    perform(`＋ under ${cleanTitle(p)}`,
+      [{ k: 'addSub',    section, title: p.title, text: title }],
+      [{ k: 'deleteSub', section, title: p.title, text: title }],
+      { now: true });
     return;
   }
 
-  const full = urgent ? `🚨 URGENT: ${title}` : title;
-  if (!tasks[section]) tasks[section] = [];
-  tasks[section].unshift({ title: full, note: '', checked: false, subtasks: [], _from: null });
+  const full = urgent ? `🚨 URGENT: ${cleanText}` : cleanText;
+  const due  = parsed.due || pendingAddDue || null;
   closeAdd();
-  if (!['All','🚨 Urgent','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
-  else { renderSidebar(); renderMobileTabs(); renderTasks(); }
-  toast(`Added to ${section}`);
-  commit({ k: 'addTask', section, title: full, note: '' }, { now: true });
+  if (!['All','🚨 Urgent','Today','Upcoming','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
+  perform(due ? `Added to ${section} · ${dueLabel(due)}` : `Added to ${section}`,
+    [{ k: 'addTask',    section, title: full, note: '', due }],
+    [{ k: 'deleteTask', section, title: full }],
+    { now: true });
 }
 
 document.getElementById('addTitle').addEventListener('keydown', e => {
@@ -1895,6 +2369,24 @@ document.getElementById('addTitle').addEventListener('keydown', e => {
 document.getElementById('addNewSection').addEventListener('keydown', e => {
   if (e.key === 'Enter') submitAdd();
   if (e.key === 'Escape') closeAdd();
+});
+
+// ── date on the add sheet, and the live "…friday" hint ──
+let pendingAddDue = null;
+function paintAddDue() {
+  const b = document.getElementById('addDueBtn');
+  b.textContent = pendingAddDue ? '📅 ' + dueLabel(pendingAddDue) : '📅 Add date';
+  b.classList.toggle('set', !!pendingAddDue);
+}
+document.getElementById('addDueBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  openDateMenu(e.currentTarget, pendingAddDue, v => { pendingAddDue = v; paintAddDue();
+    document.getElementById('addTitle').focus(); });
+});
+document.getElementById('addTitle').addEventListener('input', function () {
+  const hint = document.getElementById('addHint');
+  const p = parseWhen(this.value);
+  hint.textContent = p.due ? `→ ${p.text} · ${dueLabel(p.due)}` : '';
 });
 document.getElementById('addUrgent').addEventListener('change', function() {
   document.getElementById('urgentLabel').style.color = this.checked ? 'var(--urgent)' : '';
@@ -1911,19 +2403,300 @@ function closeSettings() { document.getElementById('settingsOv').classList.remov
 
 // ── TOAST ───────────────────────────────────────────────────
 let toastT;
-function toast(msg) {
+function toast(msg, opts = {}) {
   const el = document.getElementById('toast');
-  el.textContent = msg; el.classList.add('show');
-  clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('show'), 2200);
+  if (!msg) return;
+  el.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = msg;
+  el.appendChild(span);
+  if (opts.undo || opts.redo) {
+    const b = document.createElement('button');
+    b.className = 'toast-btn';
+    b.type = 'button';
+    b.textContent = opts.undo ? 'Undo' : 'Redo';
+    b.addEventListener('click', () => { el.classList.remove('show'); opts.undo ? undo() : redo(); });
+    el.appendChild(b);
+  }
+  el.classList.add('show');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => el.classList.remove('show'), opts.undo || opts.redo ? 5000 : 2200);
 }
 
-// ── KEYBOARD SHORTCUTS ───────────────────────────────────────
+/* ══════════════════════════════════════════════════════════════
+   THEME
+   Follows the system by default; the toggle in Settings pins it.
+   ══════════════════════════════════════════════════════════════ */
+function applyTheme(pref) {
+  const mode = pref || localStorage.getItem('rg_theme') || 'auto';
+  const dark = mode === 'dark' ||
+    (mode === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#16151a' : '#faf8f5');
+  const lbl = document.getElementById('themeLabel');
+  if (lbl) lbl.textContent = mode === 'auto' ? 'Auto' : mode === 'dark' ? 'Dark' : 'Light';
+}
+function cycleTheme() {
+  const cur = localStorage.getItem('rg_theme') || 'auto';
+  const next = cur === 'auto' ? 'light' : cur === 'light' ? 'dark' : 'auto';
+  localStorage.setItem('rg_theme', next);
+  applyTheme(next);
+  toast(`Theme: ${next}`);
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme());
+applyTheme();
+
+/* ══════════════════════════════════════════════════════════════
+   KEYBOARD CONTROL
+   Arrow keys / j / k move a selection through the list, Space completes,
+   E edits, D sets a date, Backspace deletes, Enter expands. Cmd+K opens a
+   palette that searches every task and every command.
+   ══════════════════════════════════════════════════════════════ */
+let selectedKey = null;   // "section::title" of the highlighted card
+
+function visibleCards() { return [...document.querySelectorAll('#taskScroll .task-card')]; }
+function cardKeyOf(el)  { return el.dataset.dndSec + '::' + el.dataset.key; }
+
+function highlightSelected() {
+  let found = null;
+  visibleCards().forEach(el => {
+    const on = cardKeyOf(el) === selectedKey;
+    el.classList.toggle('selected', on);
+    if (on) found = el;
+  });
+  if (!found) selectedKey = null;
+  return found;
+}
+
+function moveSelection(delta) {
+  const cards = visibleCards();
+  if (!cards.length) return;
+  let i = cards.findIndex(el => cardKeyOf(el) === selectedKey);
+  i = i < 0 ? (delta > 0 ? 0 : cards.length - 1) : Math.min(cards.length - 1, Math.max(0, i + delta));
+  selectedKey = cardKeyOf(cards[i]);
+  const el = highlightSelected();
+  el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function selectedTask() {
+  const el = visibleCards().find(c => cardKeyOf(c) === selectedKey);
+  if (!el) return null;
+  const section = el.dataset.dndSec;
+  const task = (tasks[section] || []).find(t => t.title === el.dataset.key);
+  return task ? { task, section, el } : null;
+}
+
+const inField = e => e.target.matches('input,textarea,select') || e.target.isContentEditable;
+
 document.addEventListener('keydown', e => {
-  if (e.target.matches('input,textarea,select')) return;
-  if ((e.key === 'n' || e.key === 'N') && !e.metaKey && !e.ctrlKey) { e.preventDefault(); openAdd(); }
-  if (e.key === 'Escape') { closeAdd(); closeSettings(); }
-  if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) { e.preventDefault(); loadTasks(); }
+  const mod = e.metaKey || e.ctrlKey;
+
+  // Undo / redo work everywhere except inside a text field
+  if (mod && (e.key === 'z' || e.key === 'Z')) {
+    if (inField(e)) return;
+    e.preventDefault();
+    e.shiftKey ? redo() : undo();
+    return;
+  }
+  if (mod && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); openPalette(); return; }
+  if (inField(e)) return;
+
+  if (e.key === 'Escape') { closeAdd(); closeSettings(); closeMenu(); closePalette();
+                            selectedKey = null; highlightSelected(); return; }
+  if (mod) return;
+
+  switch (e.key) {
+    case 'ArrowDown': case 'j': e.preventDefault(); moveSelection(1);  break;
+    case 'ArrowUp':   case 'k': e.preventDefault(); moveSelection(-1); break;
+    case 'n': case 'N': e.preventDefault(); openAdd(); break;
+    case 'r': case 'R': e.preventDefault(); loadTasks(); break;
+    case '/':           e.preventDefault(); document.getElementById('searchInput').focus(); break;
+    case ' ': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); toggleTask(s.task, s.section, s.el);
+      break;
+    }
+    case 'e': case 'E': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); startEditTask(s.task, s.section, s.el);
+      break;
+    }
+    case 'd': case 'D': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault();
+      openDateMenu(s.el.querySelector('.more-btn'), s.task.due, v => setTaskDue(s.task, s.section, v));
+      break;
+    }
+    case 'Enter': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); s.el.querySelector('.expand-btn')?.click();
+      break;
+    }
+    case 'Backspace': case 'Delete': {
+      const s = selectedTask(); if (!s) return;
+      e.preventDefault(); deleteTask(s.task, s.section);
+      break;
+    }
+  }
 });
+
+/* ── COMMAND PALETTE ─────────────────────────────────────── */
+let paletteOpen = false, paletteRows = [], paletteIdx = 0;
+
+function fuzzy(needle, hay) {
+  needle = needle.toLowerCase(); hay = hay.toLowerCase();
+  if (!needle) return 0;
+  if (hay.includes(needle)) return 100 - hay.indexOf(needle);
+  let i = 0, score = 0;
+  for (const ch of hay) { if (ch === needle[i]) { i++; score++; } }
+  return i === needle.length ? score : -1;
+}
+
+function paletteCandidates() {
+  const out = [];
+  ['All','Today','Upcoming','🚨 Urgent', ...sections].forEach(s =>
+    out.push({ icon: '→', label: `Go to ${s}`, hint: 'View', run: () => setTab(s) }));
+  out.push({ icon: '＋', label: 'New task',        hint: 'N',      run: () => openAdd() });
+  out.push({ icon: '↺',  label: 'Undo last change', hint: '⌘Z',    run: () => undo() });
+  out.push({ icon: '↻',  label: 'Redo',             hint: '⇧⌘Z',   run: () => redo() });
+  out.push({ icon: '🌓', label: 'Switch theme',     hint: '',       run: () => cycleTheme() });
+  out.push({ icon: '⟳',  label: 'Sync now',         hint: 'R',      run: () => loadTasks() });
+  sections.filter(s => s !== 'Completed').forEach(sec =>
+    (tasks[sec] || []).filter(t => !t.checked).forEach(t =>
+      out.push({ icon: '○', label: cleanTitle(t), hint: sec, run: () => {
+        setTab(sec); selectedKey = sec + '::' + t.title;
+        setTimeout(() => highlightSelected()?.scrollIntoView({ block: 'center' }), 60);
+      } })));
+  return out;
+}
+
+function openPalette() {
+  if (paletteOpen) return closePalette();
+  paletteOpen = true;
+  document.getElementById('paletteOv').classList.add('open');
+  const inp = document.getElementById('paletteInput');
+  inp.value = ''; inp.focus();
+  renderPalette('');
+}
+function closePalette() {
+  paletteOpen = false;
+  document.getElementById('paletteOv').classList.remove('open');
+}
+function renderPalette(q) {
+  const all = paletteCandidates();
+  paletteRows = (q
+    ? all.map(c => ({ c, s: Math.max(fuzzy(q, c.label), fuzzy(q, c.hint || '')) }))
+         .filter(x => x.s >= 0).sort((a, b) => b.s - a.s).map(x => x.c)
+    : all).slice(0, 40);
+  paletteIdx = 0;
+  const list = document.getElementById('paletteList');
+  list.innerHTML = paletteRows.length
+    ? paletteRows.map((c, i) =>
+        `<button class="pal-row${i === 0 ? ' on' : ''}" data-i="${i}">
+           <span class="pal-icon">${c.icon}</span>
+           <span class="pal-label">${esc(c.label)}</span>
+           <span class="pal-hint">${esc(c.hint || '')}</span>
+         </button>`).join('')
+    : `<div class="pal-empty">No matches</div>`;
+  list.querySelectorAll('.pal-row').forEach(b =>
+    b.addEventListener('click', () => runPalette(parseInt(b.dataset.i))));
+}
+function movePalette(d) {
+  if (!paletteRows.length) return;
+  paletteIdx = (paletteIdx + d + paletteRows.length) % paletteRows.length;
+  const list = document.getElementById('paletteList');
+  list.querySelectorAll('.pal-row').forEach((b, i) => b.classList.toggle('on', i === paletteIdx));
+  list.querySelector('.pal-row.on')?.scrollIntoView({ block: 'nearest' });
+}
+function runPalette(i) {
+  const c = paletteRows[i ?? paletteIdx];
+  closePalette();
+  if (c) setTimeout(() => c.run(), 20);
+}
+document.getElementById('paletteInput').addEventListener('input', function () { renderPalette(this.value.trim()); });
+document.getElementById('paletteInput').addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown') { e.preventDefault(); movePalette(1); }
+  if (e.key === 'ArrowUp')   { e.preventDefault(); movePalette(-1); }
+  if (e.key === 'Enter')     { e.preventDefault(); runPalette(); }
+  if (e.key === 'Escape')    { e.preventDefault(); closePalette(); }
+});
+document.getElementById('paletteOv').addEventListener('click', e => {
+  if (e.target.id === 'paletteOv') closePalette();
+});
+
+/* ══════════════════════════════════════════════════════════════
+   TOUCH GESTURES
+   Swipe a card right to complete it, left to open its menu — the pattern
+   Things and Todoist both use. Vertical movement wins ties so the list still
+   scrolls normally, and the drag handle is excluded so reordering still works.
+   ══════════════════════════════════════════════════════════════ */
+const SWIPE_ARM = 12, SWIPE_FIRE = 78;
+
+function attachSwipe(card, task, section) {
+  let id = null, x0 = 0, y0 = 0, armed = false, active = false;
+
+  card.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse') return;             // touch/pen only
+    if (e.target.closest('.dh, .sub-dh, .nav-dh, .more-btn, .cb, .sub-cb, input, button')) return;
+    if (dnd.active) return;
+    id = e.pointerId; x0 = e.clientX; y0 = e.clientY; armed = true; active = false;
+  });
+
+  card.addEventListener('pointermove', e => {
+    if (e.pointerId !== id || !armed) return;
+    const dx = e.clientX - x0, dy = e.clientY - y0;
+    if (!active) {
+      if (Math.abs(dy) > Math.abs(dx)) { armed = false; return; }   // it's a scroll
+      if (Math.abs(dx) < SWIPE_ARM) return;
+      active = true;
+      card.classList.add('swiping');
+      try { card.setPointerCapture(id); } catch (_) {}
+    }
+    const shift = Math.sign(dx) * Math.min(Math.abs(dx), 130);
+    card.style.transform = `translateX(${shift}px)`;
+    card.classList.toggle('swipe-done', shift >=  SWIPE_FIRE);
+    card.classList.toggle('swipe-menu', shift <= -SWIPE_FIRE);
+  });
+
+  const end = e => {
+    if (e.pointerId !== id) return;
+    const dx = e.clientX - x0;
+    const wasActive = active;
+    card.classList.remove('swiping', 'swipe-done', 'swipe-menu');
+    card.style.transform = '';
+    id = null; armed = false; active = false;
+    if (!wasActive) return;
+    if (dx >= SWIPE_FIRE)      { haptic(14); toggleTask(task, section, card); }
+    else if (dx <= -SWIPE_FIRE){ haptic(14); card.querySelector('.more-btn')?.click(); }
+  };
+  card.addEventListener('pointerup', end);
+  card.addEventListener('pointercancel', end);
+}
+
+/* ── PULL TO REFRESH ─────────────────────────────────────── */
+(function () {
+  const scroll = document.getElementById('taskScroll');
+  const ind = document.getElementById('ptr');
+  if (!scroll || !ind) return;
+  let y0 = null, pulling = false;
+  scroll.addEventListener('touchstart', e => {
+    y0 = scroll.scrollTop <= 0 ? e.touches[0].clientY : null; pulling = false;
+  }, { passive: true });
+  scroll.addEventListener('touchmove', e => {
+    if (y0 == null) return;
+    const dy = e.touches[0].clientY - y0;
+    if (dy <= 0) { ind.style.height = '0px'; pulling = false; return; }
+    pulling = true;
+    const h = Math.min(dy * 0.45, 72);
+    ind.style.height = h + 'px';
+    ind.classList.toggle('ready', h >= 56);
+  }, { passive: true });
+  scroll.addEventListener('touchend', () => {
+    if (pulling && ind.classList.contains('ready')) { haptic(12); ind.classList.add('spin'); loadTasks({ quiet: true }).finally(() => { ind.classList.remove('spin', 'ready'); ind.style.height = '0px'; }); }
+    else { ind.classList.remove('ready'); ind.style.height = '0px'; }
+    y0 = null; pulling = false;
+  });
+})();
 
 // ── DRAG & DROP ──────────────────────────────────────────────
 // Rewritten to fix the glitchiness:
@@ -2085,7 +2858,7 @@ function performDrop({ type, src, overEl, overBefore }) {
     arr.splice(Math.max(0, Math.min(arr.length, at)), 0, item);
   };
 
-  let op = null;
+  let op = null, inverse = null, label = '';
 
   if (type === 'task') {
     const tgtSec = overEl.dataset.dndSec;
@@ -2097,7 +2870,9 @@ function performDrop({ type, src, overEl, overBefore }) {
     if (srcIdx < 0) return;
     const item = srcArr.splice(srcIdx, 1)[0];
     place(tasks[tgtSec], item, tgtIdx, src.section === tgtSec, srcIdx);
-    op = { k: 'moveTask', title: item.title, from: src.section, to: tgtSec, index: tasks[tgtSec].indexOf(item) };
+    op      = { k: 'moveTask', title: item.title, from: src.section, to: tgtSec, index: tasks[tgtSec].indexOf(item) };
+    inverse = { k: 'moveTask', title: item.title, from: tgtSec, to: src.section, index: srcIdx };
+    label   = 'Moved';
 
   } else if (type === 'subtask') {
     const arr = src.task.subtasks || [];
@@ -2108,7 +2883,9 @@ function performDrop({ type, src, overEl, overBefore }) {
     const item = arr.splice(srcIdx, 1)[0];
     place(arr, item, tgtIdx, true, srcIdx);
     const parentSec = sections.find(s => (tasks[s] || []).includes(src.task));
-    op = { k: 'moveSub', section: parentSec, title: src.task.title, subText: item.text, index: arr.indexOf(item) };
+    op      = { k: 'moveSub', section: parentSec, title: src.task.title, subText: item.text, index: arr.indexOf(item) };
+    inverse = { k: 'moveSub', section: parentSec, title: src.task.title, subText: item.text, index: srcIdx };
+    label   = 'Reordered';
 
   } else if (type === 'section') {
     const moveable = sections.filter(s => s !== 'Completed');
@@ -2118,11 +2895,19 @@ function performDrop({ type, src, overEl, overBefore }) {
     const item = moveable.splice(src.index, 1)[0];
     place(moveable, item, tgtIdx, true, src.index);
     sections = [...moveable, ...fixed];
-    op = { k: 'moveSection', name: item, index: moveable.indexOf(item) };
+    op      = { k: 'moveSection', name: item, index: moveable.indexOf(item) };
+    inverse = { k: 'moveSection', name: item, index: src.index };
+    label   = 'Reordered';
   }
 
-  renderSidebar(); renderMobileTabs(); renderTasks();
-  if (op) commit(op);
+  if (!op) { renderAll(); return; }
+  // The move is already applied locally, so only record and send it.
+  renderAll();
+  commit(op);
+  undoStack.push({ label, forward: [op], inverse: [inverse] });
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  haptic();
 }
 </script>
 </body>
