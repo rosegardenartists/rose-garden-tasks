@@ -909,10 +909,100 @@ async function loadTasks(opts = {}) {
     if (migrated) commit({ k: 'noop' }, { now: true });
     if (queue.length) flush();
     setSync(queue.length ? 'saving' : 'idle');
+    drainInbox();
   } catch (_) { setSync('offline'); }
 }
 
+/* ── CLAUDE INBOX ────────────────────────────────────────────
+   Claude's Google Drive connector can create files but cannot overwrite an
+   existing one, so it can't edit TASKS.md directly. Instead it drops a small
+   file named `rg-inbox-<anything>` into Drive; the app picks those up, folds
+   the tasks into the list, and bins the file. Net effect: "Claude, add X to
+   Personal" shows up here on its own, from any device.
+
+   Inbox file format — one task per line, blank lines and #comments ignored:
+       Personal :: Grout the kitchen
+       Label :: !Call Preston back        ← leading ! marks it urgent
+       Buy milk                           ← no section given, goes to Personal
+*/
+const INBOX_QUERY = "name contains 'rg-inbox' and trashed = false";
+
+async function inboxList() {
+  const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(INBOX_QUERY)}`
+            + `&fields=files(id,name,mimeType)&pageSize=20`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!r.ok) return [];
+  return (await r.json()).files || [];
+}
+async function inboxRead(f) {
+  // Drive may have converted a plain-text upload into a Google Doc.
+  const url = f.mimeType === 'application/vnd.google-apps.document'
+    ? `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=text/plain`
+    : `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  return r.ok ? r.text() : '';
+}
+async function inboxBin(f) {
+  await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trashed: true })
+  });
+}
+
+function parseInbox(text) {
+  const out = [];
+  text.split('\n').forEach(raw => {
+    let line = raw.replace(/^\s*[-*]\s+/, '').trim();
+    if (!line || line.startsWith('#')) return;
+    let section = null, title = line;
+    const m = line.match(/^(.+?)\s*(?:::|\|)\s*(.+)$/);
+    if (m) { section = m[1].trim(); title = m[2].trim(); }
+    let urgent = false;
+    if (/^!/.test(title)) { urgent = true; title = title.replace(/^!\s*/, ''); }
+    title = title.replace(/^\*\*|\*\*$/g, '').trim();
+    if (!title) return;
+    const known = sections.find(s => s.toLowerCase() === String(section || '').toLowerCase());
+    out.push({
+      section: known || sections.find(s => s !== 'Completed') || 'Personal',
+      title: urgent ? `🚨 URGENT: ${title}` : title
+    });
+  });
+  return out;
+}
+
+async function drainInbox() {
+  if (!accessToken || !sections.length) return 0;
+  let files;
+  try { files = await inboxList(); } catch (_) { return 0; }
+  if (!files.length) return 0;
+
+  let added = 0, names = [];
+  for (const f of files) {
+    let text = '';
+    try { text = await inboxRead(f); } catch (_) { continue; }
+    for (const item of parseInbox(text)) {
+      const exists = (tasks[item.section] || []).some(t => t.title === item.title);
+      if (!exists) {
+        if (!tasks[item.section]) tasks[item.section] = [];
+        tasks[item.section].unshift({ title: item.title, note: '', checked: false, subtasks: [], _from: null });
+        queue.push({ k: 'addTask', section: item.section, title: item.title, note: '' });
+        added++; names.push(item.title);
+      }
+    }
+    try { await inboxBin(f); } catch (_) {}
+  }
+  if (added) {
+    persistQueue();
+    renderSidebar(); renderMobileTabs(); renderTasks();
+    toast(added === 1 ? `＋ ${names[0]}` : `＋ ${added} tasks from Claude`);
+    flush();
+  }
+  return added;
+}
+
 const POLL_MS = 4000;
+let pollTick = 0;
 let polling = false;
 async function pollForChanges(force = false) {
   if (polling || !accessToken) return;
@@ -925,6 +1015,11 @@ async function pollForChanges(force = false) {
   }
   polling = true;
   try {
+    // Check for anything Claude dropped off, every third tick (~12s) and on
+    // every forced poll (app open, tab focus, back online).
+    if (force || pollTick++ % 3 === 0) {
+      if (await drainInbox()) return;
+    }
     const v = await driveVersion();
     if (v == null || v === baseVersion) { setSync(queue.length ? 'saving' : 'idle'); return; }
     const md = await driveGet();
