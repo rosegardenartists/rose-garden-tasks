@@ -409,7 +409,9 @@
     .task-card { transition: box-shadow .15s var(--ease), opacity .2s var(--ease), transform .18s var(--ease), border-color .15s; }
     .task-card.selected { box-shadow: 0 0 0 2px var(--ring); border-color: transparent; }
     .task-card.vanishing { opacity: 0; transform: scale(.97); }
-    #taskScroll .task-card { animation: cardIn .18s var(--ease) both; }
+    /* Only cards that are genuinely new animate in. Animating on every render
+       made the whole list shimmer each time a save or a sync came back. */
+    #taskScroll .task-card.fresh { animation: cardIn .18s var(--ease) both; }
     @keyframes cardIn { from { opacity: 0; transform: translateY(4px) } to { opacity: 1; transform: none } }
 
     /* ─── SWIPE ────────────────────────────────────────────── */
@@ -1275,9 +1277,17 @@ function commit(op, opts = {}) {
   else { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 400); }
 }
 
+/* Swap in a model from Drive. If it says exactly what the screen already says
+   — which is the normal case after our own save round-trips — don't touch the
+   DOM at all. Re-rendering identical content was the main source of flicker. */
 function adoptModel(model, { render = true } = {}) {
+  const before = render ? toMarkdown() : null;
   sections = model.sections; tasks = model.tasks;
-  if (render) { renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect(); }
+  if (!render) return false;
+  const after = toMarkdown();
+  if (after === before) return false;          // nothing visibly changed
+  renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
+  return true;
 }
 
 async function flush() {
@@ -1320,6 +1330,10 @@ async function flush() {
       // jumped by more than one. Check the file again straight away so the
       // healing pass can put back anything we trampled.
       if (Number(newVersion) > Number(v) + 1) setTimeout(() => pollForChanges(true), 50);
+      // A write race can only happen around a save, so verify shortly after one
+      // rather than polling fast all day. One tiny version probe per action —
+      // this is what keeps the 30s idle interval from slowing down recovery.
+      verifySoon();
       return;
     }
     setSync('offline');
@@ -1441,9 +1455,25 @@ async function drainInbox() {
   return added;
 }
 
-const POLL_MS = 4000;
+/* 30s in the background. Your own changes never wait for this — they save
+   immediately — and switching back to the tab checks straight away, so the
+   only thing the interval governs is how long a change made somewhere else
+   can sit unseen while you're staring at the screen. */
+const POLL_MS = 30000;
 let pollTick = 0;
 let polling = false;
+
+/* Called just after a save lands. Re-reads the file a couple of seconds later
+   to confirm our change is still there — the only window in which another
+   device's write can collide with ours. Cheap, and independent of POLL_MS. */
+let verifyT = null;
+function verifySoon(delay = 2200) {
+  clearTimeout(verifyT);
+  verifyT = setTimeout(() => {
+    if (dnd.active) return verifySoon(1200);
+    pollForChanges(true);
+  }, delay);
+}
 async function pollForChanges(force = false) {
   if (polling || !accessToken) return;
   if (!force) {
@@ -1455,11 +1485,10 @@ async function pollForChanges(force = false) {
   }
   polling = true;
   try {
-    // Check for anything Claude dropped off, every third tick (~12s) and on
-    // every forced poll (app open, tab focus, back online).
-    if (force || pollTick++ % 3 === 0) {
-      if (await drainInbox()) return;
-    }
+    // Check for anything Claude dropped off on every tick, and on every forced
+    // poll (app open, tab focus, back online).
+    pollTick++;
+    if (await drainInbox()) return;
     const v = await driveVersion();
     if (v == null || v === baseVersion) { setSync(queue.length ? 'saving' : 'idle'); return; }
     const md = await driveGet();
@@ -1472,7 +1501,7 @@ async function pollForChanges(force = false) {
     const lost = findLostOps(model);
     lost.forEach(op => applyOp(model, op));
 
-    adoptModel(model);
+    const changed = adoptModel(model);
     if (lost.length) {
       lost.forEach(op => queue.push(op));
       persistQueue();
@@ -1481,7 +1510,9 @@ async function pollForChanges(force = false) {
       commit({ k: 'noop' }, { now: true });
     }
     setSync(queue.length ? 'saving' : 'idle');
-    if (!lost.length) toast('🔄 Updated');
+    // Only say something if the screen actually changed. A version bump from
+    // our own save is not news.
+    if (changed && !lost.length) toast('🔄 Updated');
   } catch (_) { setSync('offline'); }
   finally { polling = false; }
 }
@@ -1927,9 +1958,17 @@ function taskMenu(btn, task, section, card) {
 }
 
 // ── RENDER TASKS ─────────────────────────────────────────────
+let renderedKeys = new Set();   // what was on screen last time, so only new cards animate
+
 function renderTasks() {
   const scroll = document.getElementById('taskScroll');
   const savedTop = scroll.scrollTop; // preserve scroll!
+  const wasRendered = renderedKeys;
+  renderedKeys = new Set();
+  freshCheck = key => {
+    renderedKeys.add(key);
+    return wasRendered.size > 0 && !wasRendered.has(key);
+  };
   scroll.innerHTML = '';
 
   const items = getItems();
@@ -2005,6 +2044,7 @@ function makeCard(task, section) {
   card.setAttribute('data-key', task.title);
   card.setAttribute('role', 'listitem');
   if (selectedKey === section + '::' + task.title) card.classList.add('selected');
+  if (freshCheck(cardKey)) card.classList.add('fresh');
 
   const isDone = section === 'Completed' || task.checked;
   const showSec = ['All','🚨 Urgent'].includes(activeTab) ? '' : '';
@@ -2453,6 +2493,7 @@ applyTheme();
    palette that searches every task and every command.
    ══════════════════════════════════════════════════════════════ */
 let selectedKey = null;   // "section::title" of the highlighted card
+let freshCheck = () => false;   // set per-render; true only for cards that just appeared
 
 function visibleCards() { return [...document.querySelectorAll('#taskScroll .task-card')]; }
 function cardKeyOf(el)  { return el.dataset.dndSec + '::' + el.dataset.key; }
