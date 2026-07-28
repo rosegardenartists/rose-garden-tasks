@@ -911,7 +911,6 @@ function tokenAlive(margin = EXP_MARGIN_MS) {
 }
 
 function saveToken(resp) {
-  // Remembering the address lets Google skip the account chooser next time.
   accessToken = resp.access_token;
   const ttl = (Number(resp.expires_in) || 3600) * 1000;
   tokenExp = Date.now() + ttl;
@@ -919,6 +918,32 @@ function saveToken(resp) {
   store.set('rg_token_exp', String(tokenExp));
   setAuthWarn(false);
   scheduleRenew();
+  rememberAccount();
+}
+
+/* Which Google account is this?
+
+   It matters more than it sounds. Ethan is signed into two — a personal gmail
+   and ethan@rosegardenartists.com, which owns the task file. When a renewal
+   asks Google for a token without naming an account, Google looks at whichever
+   session is active in the browser, finds the wrong one, and gives up with
+   "interaction_required" — which is exactly why the app kept asking him to sign
+   in again. Naming the account in the renewal request fixes it. */
+async function rememberAccount(force = false) {
+  if (!accessToken) return;
+  if (!force && store.get('rg_email')) return;
+  try {
+    const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.email) {
+      store.set('rg_email', j.email);
+      const el = document.getElementById('setEmail');
+      if (el) el.textContent = j.email;
+    }
+  } catch (_) {}
 }
 
 // The GIS script loads async — don't assume it's there yet.
@@ -1031,7 +1056,10 @@ function popupRenew({ interactive = false } = {}) {
           if (resp && resp.access_token) { saveToken(resp); done(true); } else done(false);
         };
         client.error_callback = () => done(false);
-        try { client.requestAccessToken({ prompt: interactive ? '' : '' }); }
+        const opts = { prompt: '' };
+        const email = store.get('rg_email');
+        if (email) opts.hint = email;          // GIS calls it "hint"
+        try { client.requestAccessToken(opts); }
         catch (_) { done(false); }
       });
     } catch (_) { return false; }
