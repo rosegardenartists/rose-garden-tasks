@@ -864,10 +864,60 @@ function applyOp(model, op) {
    are still in the file — if one went missing, it quietly puts it back. The
    loser of a race repairs itself within a few seconds. */
 const HEAL_WINDOW_MS = 2 * 60 * 1000;
+const MAX_HEALS = 2;          // never re-apply the same op more than twice
 let recentOps = [];
 
+/* A newer op supersedes older ones about the same thing. Without this, e.g.
+   renaming a task would leave the old "addTask <old title>" in the history,
+   the healer would decide it had gone missing, and it would keep resurrecting
+   the task under its old name. */
+function reconcileRecent(op) {
+  const refersTo = (o, title) => o.title === title || o.from === title;
+
+  switch (op.k) {
+    case 'editTask':
+      recentOps.forEach(({ op: o }) => {
+        if (o === op) return;
+        if (o.title === op.from) o.title = op.title;
+        if (o.from  === op.from) o.from  = op.title;
+      });
+      break;
+    case 'moveTask':
+      recentOps.forEach(({ op: o }) => {
+        if (o !== op && o.section && refersTo(o, op.title)) o.section = op.to;
+      });
+      break;
+    case 'deleteTask':
+      recentOps = recentOps.filter(({ op: o }) => o === op || !refersTo(o, op.title));
+      break;
+    case 'completeTask':
+      recentOps = recentOps.filter(({ op: o }) => o === op || o.k !== 'uncompleteTask' || o.title !== op.title);
+      break;
+    case 'uncompleteTask':
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(['completeTask', 'promoteSub'].includes(o.k) && refersTo(o, op.title)));
+      break;
+    case 'editSub':
+      recentOps.forEach(({ op: o }) => {
+        if (o !== op && o.title === op.title && (o.text === op.from || o.subText === op.from)) {
+          if (o.text)    o.text    = op.text;
+          if (o.subText) o.subText = op.text;
+        }
+      });
+      break;
+    case 'deleteSub':
+    case 'promoteSub': {
+      const gone = op.k === 'deleteSub' ? op.text : op.subText;
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(['addSub', 'editSub'].includes(o.k) && o.title === op.title && o.text === gone));
+      break;
+    }
+  }
+}
+
 function rememberOp(op) {
-  recentOps.push({ op, at: Date.now() });
+  reconcileRecent(op);
+  recentOps.push({ op, at: Date.now(), heals: 0 });
   const cut = Date.now() - HEAL_WINDOW_MS;
   recentOps = recentOps.filter(r => r.at >= cut);
 }
@@ -901,11 +951,15 @@ function opSatisfied(model, op) {
   }
 }
 
-// Returns the ops that vanished from the file and need re-applying.
+// Returns the ops that vanished from the file and need re-applying. Each op is
+// only ever retried a couple of times — a healer that can't win should give up
+// rather than fight the file forever.
 function findLostOps(model) {
   const cut = Date.now() - HEAL_WINDOW_MS;
   recentOps = recentOps.filter(r => r.at >= cut);
-  return recentOps.filter(r => !opSatisfied(model, r.op)).map(r => r.op);
+  const lost = recentOps.filter(r => r.heals < MAX_HEALS && !opSatisfied(model, r.op));
+  lost.forEach(r => r.heals++);
+  return lost.map(r => r.op);
 }
 
 // Every mutation goes through here: apply locally for an instant response,
