@@ -233,7 +233,7 @@
 
     /* ─── SUBTASKS ─────────────────────────────────────────── */
     .subs-wrap { max-height: 0; overflow: hidden; transition: max-height .25s ease; }
-    .subs-wrap.open { max-height: 800px; }
+    .subs-wrap.open { max-height: 3000px; }
     .subs-list { padding: 0 12px 10px 40px; }
 
     .sub-item {
@@ -257,8 +257,39 @@
     .sub-text { font-size: 13px; color: var(--text2); flex: 1; }
     .sub-text.done { text-decoration: line-through; opacity: 0.5; }
 
+    /* ─── ADD SUBTASK ──────────────────────────────────────── */
+    .sub-add {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 0 2px; border-top: 1px solid var(--border-lt);
+    }
+    .sub-add-btn {
+      background: none; border: none; padding: 0; cursor: pointer;
+      font: inherit; font-size: 12px; font-weight: 600; color: var(--muted);
+      display: flex; align-items: center; gap: 5px;
+    }
+    .sub-add-btn:hover { color: var(--accent); }
+    .sub-add-input {
+      flex: 1; font: inherit; font-size: 13px; color: var(--text2);
+      border: none; border-bottom: 1.5px solid var(--accent);
+      background: none; outline: none; padding: 2px 0; display: none;
+    }
+    .sub-add.editing .sub-add-btn { display: none; }
+    .sub-add.editing .sub-add-input { display: block; }
+
     /* ─── DRAG INDICATOR ───────────────────────────────────── */
-    .dnd-line { height: 2px; background: var(--accent); border-radius: 2px; margin: 2px 0; pointer-events: none; }
+    /* Fixed-position so inserting it never reflows the list. Reflow was what
+       made dragging feel glitchy: the line changed layout, which moved the
+       element under the cursor, which changed the drop target, and so on. */
+    .dnd-line {
+      position: fixed; height: 2px; background: var(--accent);
+      border-radius: 2px; pointer-events: none; z-index: 9998;
+    }
+    .dnd-line::before {
+      content: ''; position: absolute; left: -3px; top: -3px;
+      width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    }
+    body.dnd-dragging, body.dnd-dragging * { cursor: grabbing !important; }
+    body.dnd-dragging { -webkit-user-select: none; user-select: none; }
 
     /* ─── FAB ──────────────────────────────────────────────── */
     .fab {
@@ -556,8 +587,13 @@ async function drivePut(content) {
   });
 }
 function scheduleSave() {
+  pendingSave = true;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => drivePut(toMarkdown()), 800);
+  saveTimer = setTimeout(async () => {
+    const md = toMarkdown();
+    try { await drivePut(md); lastRemoteMd = md; }
+    finally { pendingSave = false; }
+  }, 800);
 }
 
 // ── MARKDOWN ────────────────────────────────────────────────
@@ -609,14 +645,47 @@ function toMarkdown() {
 }
 
 // ── LOAD ────────────────────────────────────────────────────
-async function loadTasks() {
-  document.getElementById('taskScroll').innerHTML = '<div class="load-st"><div class="spinner"></div></div>';
+let lastRemoteMd = null;   // last markdown we know is on Drive
+let pendingSave  = false;  // true while a local edit is waiting to be written
+
+async function loadTasks(opts = {}) {
+  if (!opts.quiet) {
+    document.getElementById('taskScroll').innerHTML = '<div class="load-st"><div class="spinner"></div></div>';
+  }
   const md = await driveGet();
-  if (!md) return;
+  if (md == null) return;
+  lastRemoteMd = md;
   const p = parseMd(md);
   sections = p.sections; tasks = p.tasks;
+  // Any subtask already ticked in the file gets promoted to Completed, so the
+  // app and the desktop dashboard agree on where finished subtasks live.
+  const migrated = migrateCheckedSubtasks();
   renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
+  if (migrated) scheduleSave();
 }
+
+// ── AUTO-REFRESH ────────────────────────────────────────────
+// Picks up items added from anywhere else — Claude, another device, the
+// desktop dashboard — without needing a manual refresh.
+const POLL_MS = 20000;
+async function pollForChanges() {
+  if (!accessToken || pendingSave || dnd.active) return;
+  if (document.getElementById('addSheet')?.classList.contains('open')) return;
+  let md;
+  try { md = await driveGet(); } catch (_) { return; }
+  if (md == null || md === lastRemoteMd) return;
+  lastRemoteMd = md;
+  const p = parseMd(md);
+  sections = p.sections; tasks = p.tasks;
+  const migrated = migrateCheckedSubtasks();
+  renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
+  if (migrated) scheduleSave();
+  toast('🔄 Updated');
+}
+setInterval(pollForChanges, POLL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollForChanges(); });
+window.addEventListener('focus', pollForChanges);
+window.addEventListener('online', pollForChanges);
 
 // ── SIDEBAR ─────────────────────────────────────────────────
 const DH = `<svg class="nav-dh" width="10" height="12" viewBox="0 0 10 12" fill="currentColor"><circle cx="3" cy="2" r="1.1"/><circle cx="7" cy="2" r="1.1"/><circle cx="3" cy="5.5" r="1.1"/><circle cx="7" cy="5.5" r="1.1"/><circle cx="3" cy="9" r="1.1"/><circle cx="7" cy="9" r="1.1"/></svg>`;
@@ -678,6 +747,34 @@ function onSearch(q) { searchQuery = q.toLowerCase(); renderTasks(); }
 // ── HELPERS ──────────────────────────────────────────────────
 function isUrgent(t) { return /urgent|🚨/i.test(t.title); }
 function cleanTitle(t) { return t.title.replace(/🚨\s*URGENT:\s*/i, '').replace(/URGENT:\s*/i, ''); }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ── SUBTASK → COMPLETED ──────────────────────────────────────
+// A finished subtask leaves its parent card and becomes its own line in
+// Completed, titled "(Parent Task) subtask text" so its origin stays visible.
+function completedTitleFor(parentTask, subText) {
+  const parent = cleanTitle(parentTask).replace(/[()]/g, '').trim();
+  return `(${parent}) ${subText}`;
+}
+function promoteSubtask(parentTask, parentSection, sub) {
+  parentTask.subtasks = (parentTask.subtasks || []).filter(s => s !== sub);
+  if (!sections.includes('Completed')) sections.push('Completed');
+  if (!tasks['Completed']) tasks['Completed'] = [];
+  tasks['Completed'].unshift({
+    title: completedTitleFor(parentTask, sub.text),
+    note: '', checked: true, subtasks: [], _from: parentSection || null
+  });
+}
+// Runs once per load: anything already ticked in the file gets moved out.
+function migrateCheckedSubtasks() {
+  let moved = 0;
+  sections.filter(s => s !== 'Completed').forEach(sec => {
+    (tasks[sec] || []).forEach(t => {
+      (t.subtasks || []).filter(s => s.checked).forEach(s => { promoteSubtask(t, sec, s); moved++; });
+    });
+  });
+  return moved;
+}
 
 function getItems() {
   let items = [];
@@ -754,24 +851,29 @@ function makeCard(task, section) {
   card.setAttribute('data-dnd-sec', section);
   card.setAttribute('data-dnd-idx', idx);
 
+  const isDone = section === 'Completed' || task.checked;
   const metaHtml = (urgent || hasSubs) ? `
     <div class="task-meta">
       ${urgent ? '<span class="badge badge-u">🚨 Urgent</span>' : ''}
-      ${hasSubs ? `<span class="badge badge-s">${doneSubs}/${task.subtasks.length}</span>` : ''}
+      ${hasSubs ? `<span class="badge badge-s">${task.subtasks.length}</span>` : ''}
     </div>` : '';
+
+  // The chevron is always present on open tasks so a subtask can be added to
+  // any of them, not just the ones that already have some.
+  const showExpander = !isDone || hasSubs;
 
   card.innerHTML = `
     <div class="task-row">
       ${CARD_DH}
       <div class="cb ${task.checked ? 'checked' : ''}"></div>
       <div class="task-body">
-        <div class="task-title ${task.checked ? 'done' : ''}">${cleanTitle(task)}</div>
-        ${task.note ? `<div class="task-note">${task.note}</div>` : ''}
+        <div class="task-title ${task.checked ? 'done' : ''}">${esc(cleanTitle(task))}</div>
+        ${task.note ? `<div class="task-note">${esc(task.note)}</div>` : ''}
         ${metaHtml}
       </div>
-      ${hasSubs ? `<div class="expand-btn ${expanded ? 'open' : ''}">›</div>` : ''}
+      ${showExpander ? `<div class="expand-btn ${expanded ? 'open' : ''}">›</div>` : ''}
     </div>
-    ${hasSubs ? `
+    ${showExpander ? `
       <div class="subs-wrap ${expanded ? 'open' : ''}">
         <div class="subs-list"></div>
       </div>` : ''}
@@ -784,7 +886,7 @@ function makeCard(task, section) {
   });
 
   // Expand subtasks (no re-render)
-  if (hasSubs) {
+  if (showExpander) {
     const wrap = card.querySelector('.subs-wrap');
     const btn  = card.querySelector('.expand-btn');
     const body = card.querySelector('.task-body');
@@ -808,7 +910,7 @@ function makeCard(task, section) {
   return card;
 }
 
-function buildSubtasks(container, task) {
+function buildSubtasks(container, task, section) {
   container.innerHTML = '';
   (task.subtasks||[]).forEach((st, i) => {
     const item = document.createElement('div');
@@ -818,25 +920,69 @@ function buildSubtasks(container, task) {
     item.innerHTML = `
       ${SUB_DH}
       <div class="sub-cb ${st.checked ? 'checked' : ''}"></div>
-      <span class="sub-text ${st.checked ? 'done' : ''}">${st.text}</span>
+      <span class="sub-text ${st.checked ? 'done' : ''}">${esc(st.text)}</span>
     `;
-    // Surgical toggle — no re-render at all
+    // Ticking a subtask promotes it into Completed as "(Parent) subtask".
     item.querySelector('.sub-cb').addEventListener('click', e => {
       e.stopPropagation();
-      st.checked = !st.checked;
-      item.querySelector('.sub-cb').classList.toggle('checked');
-      item.querySelector('.sub-text').classList.toggle('done');
-      // Update subtask count badge
-      const badge = item.closest('.task-card').querySelector('.badge-s');
-      if (badge) {
-        const done = task.subtasks.filter(s => s.checked).length;
-        badge.textContent = `${done}/${task.subtasks.length}`;
-      }
-      scheduleSave(); // save in background, no scroll jump
+      item.querySelector('.sub-cb').classList.add('checked');
+      item.querySelector('.sub-text').classList.add('done');
+      item.style.transition = 'opacity .15s';
+      item.style.opacity = '0.2';
+      setTimeout(() => {
+        expandedIds.add(section + '::' + task.title);
+        promoteSubtask(task, section, st);
+        renderSidebar(); renderMobileTabs(); renderTasks();
+        toast('✅ Moved to Completed');
+        scheduleSave();
+      }, 150);
     });
     makeDraggable(item, 'subtask', { task, index: i }, '.sub-dh');
     container.appendChild(item);
   });
+
+  // ── Add-subtask row ──
+  const add = document.createElement('div');
+  add.className = 'sub-add';
+  add.innerHTML = `
+    <button class="sub-add-btn" type="button">＋ Add subtask</button>
+    <input class="sub-add-input" type="text" placeholder="Subtask…" />
+  `;
+  const btn   = add.querySelector('.sub-add-btn');
+  const input = add.querySelector('.sub-add-input');
+
+  const open = e => {
+    e.stopPropagation();
+    add.classList.add('editing');
+    input.focus();
+  };
+  const commit = keepOpen => {
+    const text = input.value.trim();
+    if (!text) { add.classList.remove('editing'); return; }
+    task.subtasks = task.subtasks || [];
+    task.subtasks.push({ text, checked: false });
+    input.value = '';
+    expandedIds.add(section + '::' + task.title);
+    // Re-render straight away so the new subtask shows up without a refresh.
+    renderSidebar(); renderMobileTabs(); renderTasks();
+    scheduleSave();
+    if (keepOpen) {
+      const card = document.querySelector(`.task-card[data-dnd-sec="${CSS.escape(section)}"][data-dnd-idx="${(tasks[section]||[]).indexOf(task)}"]`);
+      const nextInput = card?.querySelector('.sub-add-input');
+      if (nextInput) { nextInput.closest('.sub-add').classList.add('editing'); nextInput.focus(); }
+    }
+  };
+
+  btn.addEventListener('click', open);
+  input.addEventListener('click', e => e.stopPropagation());
+  input.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter')  { e.preventDefault(); commit(true); }
+    if (e.key === 'Escape') { e.preventDefault(); input.value = ''; add.classList.remove('editing'); btn.focus(); }
+  });
+  input.addEventListener('blur', () => { if (input.value.trim()) commit(false); else add.classList.remove('editing'); });
+
+  container.appendChild(add);
 }
 
 // ── TOGGLE TASK ──────────────────────────────────────────────
@@ -929,73 +1075,130 @@ document.addEventListener('keydown', e => {
 });
 
 // ── DRAG & DROP ──────────────────────────────────────────────
-const dnd = { active: false, srcEl: null, ghost: null, type: null, src: null, overEl: null, overBefore: false };
+// Rewritten to fix the glitchiness:
+//   • a 6px threshold, so a tap on the handle is not a drag
+//   • the ghost tracks the exact point you grabbed (no rotate/scale drift)
+//   • the drop indicator is position:fixed, so it never reflows the list —
+//     reflow was what made the target flip back and forth under the cursor
+//   • candidates are measured once per pointermove instead of relying on
+//     elementFromPoint, which kept landing on the wrong element
+//   • edge auto-scroll while dragging
+const dnd = { active: false, srcEl: null, ghost: null, type: null, src: null, overEl: null, overBefore: false, line: null };
+
+const DND_THRESHOLD = 6;
+
+function dndContainerFor(type, el) {
+  if (type === 'task')    return document.getElementById('taskScroll');
+  if (type === 'section') return document.getElementById('sidebarNav');
+  if (type === 'subtask') return el.closest('.subs-list');
+  return document.body;
+}
+
+function dndScrollerFor(type) {
+  if (type === 'task')    return document.getElementById('taskScroll');
+  if (type === 'section') return document.getElementById('sidebarNav');
+  return null;
+}
+
+function showDropLine(target, before) {
+  if (!dnd.line) {
+    dnd.line = document.createElement('div');
+    dnd.line.className = 'dnd-line';
+    document.body.appendChild(dnd.line);
+  }
+  const r = target.getBoundingClientRect();
+  dnd.line.style.left  = r.left + 'px';
+  dnd.line.style.width = r.width + 'px';
+  dnd.line.style.top   = ((before ? r.top : r.bottom) - 1) + 'px';
+}
+
+function clearDropLine() { dnd.line?.remove(); dnd.line = null; }
 
 function makeDraggable(el, type, data, handleSelector) {
   const handleEl = el.querySelector(handleSelector);
   if (!handleEl) return;
 
-  let pid, startX, startY, startL, startT;
+  let pid = null, startX = 0, startY = 0, startL = 0, startT = 0, armed = false;
 
-  handleEl.addEventListener('pointerdown', e => {
+  const onDown = e => {
+    if (dnd.active || pid !== null) return;
+    if (e.button != null && e.button !== 0 && e.pointerType === 'mouse') return;
     e.preventDefault(); e.stopPropagation();
-    if (dnd.active) return;
 
     pid = e.pointerId;
-    const rect = el.getBoundingClientRect();
+    armed = true;
     startX = e.clientX; startY = e.clientY;
-    startL = rect.left;  startT = rect.top;
+    const rect = el.getBoundingClientRect();
+    startL = rect.left; startT = rect.top;
 
-    try { handleEl.setPointerCapture(pid); } catch(_) {}
+    try { handleEl.setPointerCapture(pid); } catch (_) {}
+    handleEl.addEventListener('pointermove', onMove);
+    handleEl.addEventListener('pointerup', onEnd);
+    handleEl.addEventListener('pointercancel', onEnd);
+  };
 
-    // Build ghost
+  function begin() {
+    const rect = el.getBoundingClientRect();
     const ghost = el.cloneNode(true);
+    ghost.querySelectorAll('input').forEach(i => i.remove());
     Object.assign(ghost.style, {
-      position: 'fixed', left: startL+'px', top: startT+'px',
-      width: rect.width+'px', opacity: '0.9', pointerEvents: 'none',
-      zIndex: '9999', transform: 'rotate(1deg) scale(1.02)',
-      boxShadow: '0 8px 24px rgba(0,0,0,.18)', margin: '0',
-      borderRadius: type === 'task' ? 'var(--r)' : (type === 'subtask' ? '0' : '6px'),
-      transition: 'none',
+      position: 'fixed', left: startL + 'px', top: startT + 'px',
+      width: rect.width + 'px', height: rect.height + 'px',
+      margin: '0', opacity: '0.92', pointerEvents: 'none', zIndex: '9999',
+      background: 'var(--card, #fff)', boxSizing: 'border-box',
+      boxShadow: '0 10px 28px rgba(0,0,0,.22)', transition: 'none',
+      borderRadius: type === 'subtask' ? '6px' : (type === 'task' ? 'var(--r)' : '8px'),
     });
     document.body.appendChild(ghost);
 
     dnd.active = true; dnd.srcEl = el; dnd.ghost = ghost;
     dnd.type = type; dnd.src = { ...data };
+    dnd.overEl = null; dnd.overBefore = false;
     el.classList.add('dragging');
-
-    handleEl.addEventListener('pointermove', onMove);
-    handleEl.addEventListener('pointerup', onEnd);
-    handleEl.addEventListener('pointercancel', onEnd);
-  });
+    document.body.classList.add('dnd-dragging');
+  }
 
   function onMove(e) {
-    if (e.pointerId !== pid || !dnd.active) return;
+    if (e.pointerId !== pid) return;
     const dx = e.clientX - startX, dy = e.clientY - startY;
-    dnd.ghost.style.left = (startL + dx) + 'px';
-    dnd.ghost.style.top  = (startT + dy) + 'px';
 
-    // Find drop target
-    dnd.ghost.style.visibility = 'hidden';
-    const hit = document.elementFromPoint(e.clientX, e.clientY);
-    dnd.ghost.style.visibility = '';
-
-    const typeAttr = `[data-dnd-type="${type}"]`;
-    const target = hit?.closest(typeAttr);
-
-    if (target && target !== el) {
-      const r = target.getBoundingClientRect();
-      const before = e.clientY < r.top + r.height / 2;
-      if (dnd.overEl !== target || dnd.overBefore !== before) {
-        dnd.overEl = target; dnd.overBefore = before;
-        document.querySelectorAll('.dnd-line').forEach(l => l.remove());
-        const line = document.createElement('div'); line.className = 'dnd-line';
-        if (before) target.before(line); else target.after(line);
-      }
-    } else if (target !== el) {
-      document.querySelectorAll('.dnd-line').forEach(l => l.remove());
-      dnd.overEl = null;
+    if (armed && !dnd.active) {
+      if (Math.hypot(dx, dy) < DND_THRESHOLD) return;
+      begin();
     }
+    if (!dnd.active) return;
+    e.preventDefault();
+
+    dnd.ghost.style.transform = `translate(${dx}px, ${dy}px)`;
+
+    // Edge auto-scroll
+    const scroller = dndScrollerFor(type);
+    if (scroller) {
+      const sr = scroller.getBoundingClientRect();
+      const EDGE = 60;
+      if (e.clientY < sr.top + EDGE)         scroller.scrollTop -= Math.max(4, (sr.top + EDGE - e.clientY) / 4);
+      else if (e.clientY > sr.bottom - EDGE) scroller.scrollTop += Math.max(4, (e.clientY - (sr.bottom - EDGE)) / 4);
+    }
+
+    // Pick the nearest sibling of the same type inside the same container.
+    const container  = dndContainerFor(type, el);
+    const candidates = container
+      ? [...container.querySelectorAll(`[data-dnd-type="${type}"]`)].filter(c => c !== el)
+      : [];
+    if (!candidates.length) { clearDropLine(); dnd.overEl = null; return; }
+
+    let best = null, bestDist = Infinity, bestBefore = false;
+    for (const c of candidates) {
+      const r = c.getBoundingClientRect();
+      if (!r.height) continue;
+      const mid = r.top + r.height / 2;
+      const d = Math.abs(e.clientY - mid);
+      if (d < bestDist) { bestDist = d; best = c; bestBefore = e.clientY < mid; }
+    }
+    if (!best) { clearDropLine(); dnd.overEl = null; return; }
+
+    dnd.overEl = best; dnd.overBefore = bestBefore;
+    showDropLine(best, bestBefore);
   }
 
   function onEnd(e) {
@@ -1003,49 +1206,61 @@ function makeDraggable(el, type, data, handleSelector) {
     handleEl.removeEventListener('pointermove', onMove);
     handleEl.removeEventListener('pointerup', onEnd);
     handleEl.removeEventListener('pointercancel', onEnd);
+    try { handleEl.releasePointerCapture(pid); } catch (_) {}
 
-    if (dnd.overEl && dnd.active) performDrop();
+    const didDrag = dnd.active;
+    const target  = dnd.overEl;
 
     dnd.ghost?.remove();
+    clearDropLine();
     el.classList.remove('dragging');
-    document.querySelectorAll('.dnd-line').forEach(l => l.remove());
-    dnd.active = false; dnd.ghost = null; dnd.overEl = null;
-    pid = undefined;
+    document.body.classList.remove('dnd-dragging');
+
+    const snapshot = { type: dnd.type, src: dnd.src, overEl: target, overBefore: dnd.overBefore };
+    dnd.active = false; dnd.ghost = null; dnd.overEl = null; dnd.srcEl = null;
+    pid = null; armed = false;
+
+    if (didDrag && target && e.type === 'pointerup') performDrop(snapshot);
   }
+
+  handleEl.addEventListener('pointerdown', onDown);
 }
 
-function performDrop() {
-  const { type, src, overEl, overBefore } = dnd;
+function performDrop({ type, src, overEl, overBefore }) {
+  const place = (arr, item, tgtIdx, sameArr, srcIdx) => {
+    let at = tgtIdx;
+    if (!overBefore) at++;
+    if (sameArr && srcIdx < at) at--;
+    arr.splice(Math.max(0, Math.min(arr.length, at)), 0, item);
+  };
 
   if (type === 'task') {
     const tgtSec = overEl.dataset.dndSec;
     const tgtIdx = parseInt(overEl.dataset.dndIdx);
     const srcArr = tasks[src.section];
-    const item   = srcArr.splice(src.index, 1)[0];
-    const tgtArr = tasks[tgtSec];
-    let at = tgtIdx;
-    if (!overBefore) at++;
-    if (src.section === tgtSec && src.index < at) at--;
-    tgtArr.splice(Math.max(0, at), 0, item);
+    if (!srcArr || !tasks[tgtSec] || isNaN(tgtIdx)) return;
+    // Look the task up by identity — indexes go stale after a re-render.
+    const srcIdx = srcArr.indexOf(src.task);
+    if (srcIdx < 0) return;
+    const item = srcArr.splice(srcIdx, 1)[0];
+    place(tasks[tgtSec], item, tgtIdx, src.section === tgtSec, srcIdx);
 
   } else if (type === 'subtask') {
-    const arr  = src.task.subtasks;
-    const tgtI = parseInt(overEl.dataset.dndIdx);
-    const item  = arr.splice(src.index, 1)[0];
-    let at = tgtI;
-    if (!overBefore) at++;
-    if (src.index < at) at--;
-    arr.splice(Math.max(0, at), 0, item);
+    const arr = src.task.subtasks || [];
+    const tgtIdx = parseInt(overEl.dataset.dndIdx);
+    if (isNaN(tgtIdx)) return;
+    const srcIdx = src.index;
+    if (srcIdx < 0 || srcIdx >= arr.length) return;
+    const item = arr.splice(srcIdx, 1)[0];
+    place(arr, item, tgtIdx, true, srcIdx);
 
   } else if (type === 'section') {
     const moveable = sections.filter(s => s !== 'Completed');
     const fixed    = sections.filter(s => s === 'Completed');
-    const tgtI = parseInt(overEl.dataset.dndIdx);
-    const item  = moveable.splice(src.index, 1)[0];
-    let at = tgtI;
-    if (!overBefore) at++;
-    if (src.index < at) at--;
-    moveable.splice(Math.max(0, at), 0, item);
+    const tgtIdx = parseInt(overEl.dataset.dndIdx);
+    if (isNaN(tgtIdx) || src.index < 0 || src.index >= moveable.length) return;
+    const item = moveable.splice(src.index, 1)[0];
+    place(moveable, item, tgtIdx, true, src.index);
     sections = [...moveable, ...fixed];
   }
 
