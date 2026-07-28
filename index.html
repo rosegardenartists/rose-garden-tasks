@@ -1932,7 +1932,7 @@ function renderSidebar() {
     const a = sec === activeTab ? ' active' : '';
     const cnt = (tasks[sec] || []).filter(t => !t.checked).length;
     const badge = cnt > 0 ? `<span class="nav-badge">${cnt}</span>` : '';
-    html += `<button class="nav-item${a}" data-dnd-type="section" data-dnd-idx="${i}" onclick="setTab('${sec.replace(/'/g,"\\'")}')">
+    html += `<button class="nav-item${a}" data-dnd-type="section" data-dnd-idx="${i}" data-key="${esc(sec)}" onclick="setTab('${sec.replace(/'/g,"\\'")}')">
       ${DH}${sec}${badge}
     </button>`;
   });
@@ -1946,7 +1946,7 @@ function renderSidebar() {
 
   // Attach drag to section items
   nav.querySelectorAll('[data-dnd-type="section"]').forEach(el => {
-    makeDraggable(el, 'section', { index: parseInt(el.dataset.dndIdx) }, '.nav-dh');
+    makeDraggable(el, 'section', { name: el.dataset.key }, '.nav-dh');
   });
 }
 
@@ -2550,7 +2550,7 @@ function makeCard(task, section) {
   }
 
   // Drag-and-drop, and swipe on touch devices
-  makeDraggable(card, 'task', { task, section, index: idx }, '.dh');
+  makeDraggable(card, 'task', { title: task.title, section }, '.dh');
   attachSwipe(card, task, section);
 
   card.addEventListener('pointerdown', () => {
@@ -2568,6 +2568,7 @@ function buildSubtasks(container, task, section) {
     item.className = 'sub-item';
     item.setAttribute('data-dnd-type', 'subtask');
     item.setAttribute('data-dnd-idx', i);
+    item.setAttribute('data-key', st.text);
     item.innerHTML = `
       ${SUB_DH}
       <div class="sub-cb ${st.checked ? 'checked' : ''}"></div>
@@ -2640,7 +2641,7 @@ function buildSubtasks(container, task, section) {
           [{ k: 'demoteSub',  section, title: task.title, subText: st.text, completedTitle, index: at }]);
       }, 150);
     });
-    makeDraggable(item, 'subtask', { task, index: i }, '.sub-dh');
+    makeDraggable(item, 'subtask', { parentTitle: task.title, section, subText: st.text }, '.sub-dh');
     container.appendChild(item);
   });
 
@@ -3186,210 +3187,257 @@ function attachSwipe(card, task, section) {
   });
 })();
 
-// ── DRAG & DROP ──────────────────────────────────────────────
-// Rewritten to fix the glitchiness:
-//   • a 6px threshold, so a tap on the handle is not a drag
-//   • the ghost tracks the exact point you grabbed (no rotate/scale drift)
-//   • the drop indicator is position:fixed, so it never reflows the list —
-//     reflow was what made the target flip back and forth under the cursor
-//   • candidates are measured once per pointermove instead of relying on
-//     elementFromPoint, which kept landing on the wrong element
-//   • edge auto-scroll while dragging
-const dnd = { active: false, srcEl: null, ghost: null, type: null, src: null, overEl: null, overBefore: false, line: null };
+/* ══════════════════════════════════════════════════════════════
+   DRAG & DROP
+
+   The hard-won lesson here: the move/up listeners must live on `window`, not
+   on the drag handle. They used to be on the handle, and anything that
+   re-rendered the list mid-drag — a sync landing, a save coming back — deleted
+   that element, took its listeners with it, and the drag never ended. The state
+   stayed stuck with `active: true`, which then refused every future drag. That
+   is what "it freezes and won't let me drop" was.
+
+   So now: window-level listeners, a cleanup that always runs, and drop targets
+   remembered by name rather than by DOM node, so a re-render mid-drag is
+   survivable instead of fatal.
+   ══════════════════════════════════════════════════════════════ */
+const dnd = {
+  active: false, armed: false, pid: null, type: null,
+  src: null, srcEl: null, ghost: null, line: null,
+  over: null, overBefore: false,
+  x0: 0, y0: 0, left0: 0, top0: 0,
+};
 
 const DND_THRESHOLD = 6;
 
 function dndContainerFor(type, el) {
   if (type === 'task')    return document.getElementById('taskScroll');
   if (type === 'section') return document.getElementById('sidebarNav');
-  if (type === 'subtask') return el.closest('.subs-list');
-  return document.body;
+  if (type === 'subtask') return el?.closest('.subs-list') || null;
+  return null;
 }
-
 function dndScrollerFor(type) {
   if (type === 'task')    return document.getElementById('taskScroll');
   if (type === 'section') return document.getElementById('sidebarNav');
   return null;
 }
 
-function showDropLine(target, before) {
+function showDropLine(rect, before) {
   if (!dnd.line) {
     dnd.line = document.createElement('div');
     dnd.line.className = 'dnd-line';
     document.body.appendChild(dnd.line);
   }
-  const r = target.getBoundingClientRect();
-  dnd.line.style.left  = r.left + 'px';
-  dnd.line.style.width = r.width + 'px';
-  dnd.line.style.top   = ((before ? r.top : r.bottom) - 1) + 'px';
+  dnd.line.style.left  = rect.left + 'px';
+  dnd.line.style.width = rect.width + 'px';
+  dnd.line.style.top   = ((before ? rect.top : rect.bottom) - 1) + 'px';
 }
 
-function clearDropLine() { dnd.line?.remove(); dnd.line = null; }
+/* Unconditional cleanup. Called on pointerup, pointercancel, Escape, losing the
+   window, or anything else that could interrupt — so the state can never strand. */
+function endDrag(applyDrop) {
+  const snapshot = dnd.active && applyDrop && dnd.over
+    ? { type: dnd.type, src: dnd.src, over: dnd.over, overBefore: dnd.overBefore }
+    : null;
+
+  try { dnd.ghost?.remove(); } catch (_) {}
+  try { dnd.line?.remove(); } catch (_) {}
+  document.querySelectorAll('.dnd-line').forEach(l => l.remove());
+  document.querySelectorAll('.task-card.dragging, .nav-item.dragging, .sub-item.dragging')
+    .forEach(el => el.classList.remove('dragging'));
+  document.body.classList.remove('dnd-dragging');
+
+  window.removeEventListener('pointermove', onDndMove, true);
+  window.removeEventListener('pointerup', onDndUp, true);
+  window.removeEventListener('pointercancel', onDndUp, true);
+
+  dnd.active = false; dnd.armed = false; dnd.pid = null;
+  dnd.ghost = null; dnd.line = null; dnd.src = null; dnd.srcEl = null;
+  dnd.over = null; dnd.type = null;
+
+  if (snapshot) performDrop(snapshot);
+}
+
+function beginDrag() {
+  const el = dnd.srcEl;
+  const rect = el.getBoundingClientRect();
+  const ghost = el.cloneNode(true);
+  ghost.querySelectorAll('input').forEach(i => i.remove());
+  Object.assign(ghost.style, {
+    position: 'fixed', left: rect.left + 'px', top: rect.top + 'px',
+    width: rect.width + 'px', height: rect.height + 'px',
+    margin: '0', opacity: '0.92', pointerEvents: 'none', zIndex: '9999',
+    background: 'var(--card, #fff)', boxSizing: 'border-box',
+    boxShadow: '0 10px 28px rgba(0,0,0,.22)', transition: 'none',
+    borderRadius: dnd.type === 'subtask' ? '6px' : (dnd.type === 'task' ? 'var(--r)' : '8px'),
+  });
+  document.body.appendChild(ghost);
+  dnd.left0 = rect.left; dnd.top0 = rect.top;
+  dnd.ghost = ghost;
+  dnd.active = true;
+  el.classList.add('dragging');
+  document.body.classList.add('dnd-dragging');
+}
+
+function onDndMove(e) {
+  if (e.pointerId !== dnd.pid) return;
+  const dx = e.clientX - dnd.x0, dy = e.clientY - dnd.y0;
+
+  if (dnd.armed && !dnd.active) {
+    if (Math.hypot(dx, dy) < DND_THRESHOLD) return;
+    beginDrag();
+  }
+  if (!dnd.active) return;
+  e.preventDefault();
+
+  dnd.ghost.style.transform = `translate(${dx}px, ${dy}px)`;
+
+  const scroller = dndScrollerFor(dnd.type);
+  if (scroller) {
+    const sr = scroller.getBoundingClientRect();
+    const EDGE = 60;
+    if (e.clientY < sr.top + EDGE)          scroller.scrollTop -= Math.max(4, (sr.top + EDGE - e.clientY) / 4);
+    else if (e.clientY > sr.bottom - EDGE)  scroller.scrollTop += Math.max(4, (e.clientY - (sr.bottom - EDGE)) / 4);
+  }
+
+  // Re-query every move: after a re-render the old nodes are gone, and this
+  // simply picks up the new ones instead of breaking.
+  const scope = dnd.type === 'subtask'
+    ? document.querySelector(`.task-card[data-key="${cssEscape(dnd.src.parentTitle)}"] .subs-list`)
+    : dndContainerFor(dnd.type);
+  if (!scope) return;
+
+  const me = dnd.type === 'section' ? dnd.src.name
+           : dnd.type === 'task'    ? dnd.src.title
+           : dnd.src.subText;
+
+  let best = null, bestDist = Infinity, bestBefore = false, bestRect = null;
+  scope.querySelectorAll(`[data-dnd-type="${dnd.type}"]`).forEach(c => {
+    if (dndKeyOf(c) === me) return;
+    const r = c.getBoundingClientRect();
+    if (!r.height) return;
+    const mid = r.top + r.height / 2;
+    const d = Math.abs(e.clientY - mid);
+    if (d < bestDist) { bestDist = d; best = c; bestBefore = e.clientY < mid; bestRect = r; }
+  });
+
+  if (!best) { dnd.line?.remove(); dnd.line = null; dnd.over = null; return; }
+
+  dnd.over = {
+    key: dndKeyOf(best),
+    sec: best.dataset.dndSec || null,
+    idx: parseInt(best.dataset.dndIdx),
+  };
+  dnd.overBefore = bestBefore;
+  showDropLine(bestRect, bestBefore);
+}
+
+function dndKeyOf(el) {
+  const t = el.dataset.dndType;
+  if (t === 'task')    return el.dataset.key;
+  if (t === 'section') return el.dataset.key;
+  return el.dataset.key;   // subtask rows carry their text in data-key too
+}
+
+function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/"/g, '\\"'); }
+
+function onDndUp(e) {
+  if (e.pointerId !== dnd.pid) return;
+  endDrag(e.type === 'pointerup');
+}
+
+// Anything that interrupts the gesture releases the drag rather than stranding it.
+window.addEventListener('blur', () => { if (dnd.armed || dnd.active) endDrag(false); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && (dnd.armed || dnd.active)) endDrag(false); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && (dnd.armed || dnd.active)) endDrag(false); }, true);
 
 function makeDraggable(el, type, data, handleSelector) {
   const handleEl = el.querySelector(handleSelector);
   if (!handleEl) return;
 
-  let pid = null, startX = 0, startY = 0, startL = 0, startT = 0, armed = false;
-
-  const onDown = e => {
-    if (dnd.active || pid !== null) return;
-    if (e.button != null && e.button !== 0 && e.pointerType === 'mouse') return;
+  handleEl.addEventListener('pointerdown', e => {
+    if (dnd.armed || dnd.active) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
     e.preventDefault(); e.stopPropagation();
 
-    pid = e.pointerId;
-    armed = true;
-    startX = e.clientX; startY = e.clientY;
-    const rect = el.getBoundingClientRect();
-    startL = rect.left; startT = rect.top;
+    dnd.armed = true;
+    dnd.pid = e.pointerId;
+    dnd.type = type;
+    dnd.src = { ...data };
+    dnd.srcEl = el;
+    dnd.x0 = e.clientX; dnd.y0 = e.clientY;
+    dnd.over = null;
 
-    try { handleEl.setPointerCapture(pid); } catch (_) {}
-    handleEl.addEventListener('pointermove', onMove);
-    handleEl.addEventListener('pointerup', onEnd);
-    handleEl.addEventListener('pointercancel', onEnd);
-  };
-
-  function begin() {
-    const rect = el.getBoundingClientRect();
-    const ghost = el.cloneNode(true);
-    ghost.querySelectorAll('input').forEach(i => i.remove());
-    Object.assign(ghost.style, {
-      position: 'fixed', left: startL + 'px', top: startT + 'px',
-      width: rect.width + 'px', height: rect.height + 'px',
-      margin: '0', opacity: '0.92', pointerEvents: 'none', zIndex: '9999',
-      background: 'var(--card, #fff)', boxSizing: 'border-box',
-      boxShadow: '0 10px 28px rgba(0,0,0,.22)', transition: 'none',
-      borderRadius: type === 'subtask' ? '6px' : (type === 'task' ? 'var(--r)' : '8px'),
-    });
-    document.body.appendChild(ghost);
-
-    dnd.active = true; dnd.srcEl = el; dnd.ghost = ghost;
-    dnd.type = type; dnd.src = { ...data };
-    dnd.overEl = null; dnd.overBefore = false;
-    el.classList.add('dragging');
-    document.body.classList.add('dnd-dragging');
-  }
-
-  function onMove(e) {
-    if (e.pointerId !== pid) return;
-    const dx = e.clientX - startX, dy = e.clientY - startY;
-
-    if (armed && !dnd.active) {
-      if (Math.hypot(dx, dy) < DND_THRESHOLD) return;
-      begin();
-    }
-    if (!dnd.active) return;
-    e.preventDefault();
-
-    dnd.ghost.style.transform = `translate(${dx}px, ${dy}px)`;
-
-    // Edge auto-scroll
-    const scroller = dndScrollerFor(type);
-    if (scroller) {
-      const sr = scroller.getBoundingClientRect();
-      const EDGE = 60;
-      if (e.clientY < sr.top + EDGE)         scroller.scrollTop -= Math.max(4, (sr.top + EDGE - e.clientY) / 4);
-      else if (e.clientY > sr.bottom - EDGE) scroller.scrollTop += Math.max(4, (e.clientY - (sr.bottom - EDGE)) / 4);
-    }
-
-    // Pick the nearest sibling of the same type inside the same container.
-    const container  = dndContainerFor(type, el);
-    const candidates = container
-      ? [...container.querySelectorAll(`[data-dnd-type="${type}"]`)].filter(c => c !== el)
-      : [];
-    if (!candidates.length) { clearDropLine(); dnd.overEl = null; return; }
-
-    let best = null, bestDist = Infinity, bestBefore = false;
-    for (const c of candidates) {
-      const r = c.getBoundingClientRect();
-      if (!r.height) continue;
-      const mid = r.top + r.height / 2;
-      const d = Math.abs(e.clientY - mid);
-      if (d < bestDist) { bestDist = d; best = c; bestBefore = e.clientY < mid; }
-    }
-    if (!best) { clearDropLine(); dnd.overEl = null; return; }
-
-    dnd.overEl = best; dnd.overBefore = bestBefore;
-    showDropLine(best, bestBefore);
-  }
-
-  function onEnd(e) {
-    if (e.pointerId !== pid) return;
-    handleEl.removeEventListener('pointermove', onMove);
-    handleEl.removeEventListener('pointerup', onEnd);
-    handleEl.removeEventListener('pointercancel', onEnd);
-    try { handleEl.releasePointerCapture(pid); } catch (_) {}
-
-    const didDrag = dnd.active;
-    const target  = dnd.overEl;
-
-    dnd.ghost?.remove();
-    clearDropLine();
-    el.classList.remove('dragging');
-    document.body.classList.remove('dnd-dragging');
-
-    const snapshot = { type: dnd.type, src: dnd.src, overEl: target, overBefore: dnd.overBefore };
-    dnd.active = false; dnd.ghost = null; dnd.overEl = null; dnd.srcEl = null;
-    pid = null; armed = false;
-
-    if (didDrag && target && e.type === 'pointerup') performDrop(snapshot);
-  }
-
-  handleEl.addEventListener('pointerdown', onDown);
+    // Listeners on the window, so a re-render that destroys this handle cannot
+    // orphan them and leave the drag hanging.
+    window.addEventListener('pointermove', onDndMove, true);
+    window.addEventListener('pointerup', onDndUp, true);
+    window.addEventListener('pointercancel', onDndUp, true);
+  });
 }
 
-function performDrop({ type, src, overEl, overBefore }) {
-  const place = (arr, item, tgtIdx, sameArr, srcIdx) => {
-    let at = tgtIdx;
-    if (!overBefore) at++;
-    if (sameArr && srcIdx < at) at--;
-    arr.splice(Math.max(0, Math.min(arr.length, at)), 0, item);
-  };
-
+/* Drops resolve by name, not by array index or DOM node — both go stale the
+   moment anything re-renders. */
+function performDrop({ type, src, over, overBefore }) {
   let op = null, inverse = null, label = '';
 
   if (type === 'task') {
-    const tgtSec = overEl.dataset.dndSec;
-    const tgtIdx = parseInt(overEl.dataset.dndIdx);
-    const srcArr = tasks[src.section];
-    if (!srcArr || !tasks[tgtSec] || isNaN(tgtIdx)) return;
-    // Look the task up by identity — indexes go stale after a re-render.
-    const srcIdx = srcArr.indexOf(src.task);
-    if (srcIdx < 0) return;
+    const from = src.section, to = over.sec;
+    const srcArr = tasks[from], tgtArr = tasks[to];
+    if (!srcArr || !tgtArr) { renderAll(); return; }
+    const srcIdx = srcArr.findIndex(t => t.title === src.title);
+    if (srcIdx < 0) { renderAll(); return; }
+    let tgtIdx = tgtArr.findIndex(t => t.title === over.key);
+    if (tgtIdx < 0) tgtIdx = isNaN(over.idx) ? tgtArr.length - 1 : over.idx;
+
     const item = srcArr.splice(srcIdx, 1)[0];
-    place(tasks[tgtSec], item, tgtIdx, src.section === tgtSec, srcIdx);
-    op      = { k: 'moveTask', title: item.title, from: src.section, to: tgtSec, index: tasks[tgtSec].indexOf(item) };
-    inverse = { k: 'moveTask', title: item.title, from: tgtSec, to: src.section, index: srcIdx };
+    let at = tgtIdx + (overBefore ? 0 : 1);
+    if (from === to && srcIdx < at) at--;
+    tgtArr.splice(Math.max(0, Math.min(tgtArr.length, at)), 0, item);
+
+    op      = { k: 'moveTask', title: item.title, from, to, index: tgtArr.indexOf(item) };
+    inverse = { k: 'moveTask', title: item.title, from: to, to: from, index: srcIdx };
     label   = 'Moved';
 
   } else if (type === 'subtask') {
-    const arr = src.task.subtasks || [];
-    const tgtIdx = parseInt(overEl.dataset.dndIdx);
-    if (isNaN(tgtIdx)) return;
-    const srcIdx = src.index;
-    if (srcIdx < 0 || srcIdx >= arr.length) return;
+    const parentSec = src.section || sections.find(s => (tasks[s] || []).some(t => t.title === src.parentTitle));
+    const parent = (tasks[parentSec] || []).find(t => t.title === src.parentTitle);
+    if (!parent) { renderAll(); return; }
+    const arr = parent.subtasks || [];
+    const srcIdx = arr.findIndex(s => s.text === src.subText);
+    if (srcIdx < 0) { renderAll(); return; }
+    let tgtIdx = arr.findIndex(s => s.text === over.key);
+    if (tgtIdx < 0) tgtIdx = isNaN(over.idx) ? arr.length - 1 : over.idx;
+
     const item = arr.splice(srcIdx, 1)[0];
-    place(arr, item, tgtIdx, true, srcIdx);
-    const parentSec = sections.find(s => (tasks[s] || []).includes(src.task));
-    op      = { k: 'moveSub', section: parentSec, title: src.task.title, subText: item.text, index: arr.indexOf(item) };
-    inverse = { k: 'moveSub', section: parentSec, title: src.task.title, subText: item.text, index: srcIdx };
+    let at = tgtIdx + (overBefore ? 0 : 1);
+    if (srcIdx < at) at--;
+    arr.splice(Math.max(0, Math.min(arr.length, at)), 0, item);
+
+    op      = { k: 'moveSub', section: parentSec, title: parent.title, subText: item.text, index: arr.indexOf(item) };
+    inverse = { k: 'moveSub', section: parentSec, title: parent.title, subText: item.text, index: srcIdx };
     label   = 'Reordered';
 
   } else if (type === 'section') {
     const moveable = sections.filter(s => s !== 'Completed');
     const fixed    = sections.filter(s => s === 'Completed');
-    const tgtIdx = parseInt(overEl.dataset.dndIdx);
-    if (isNaN(tgtIdx) || src.index < 0 || src.index >= moveable.length) return;
-    const item = moveable.splice(src.index, 1)[0];
-    place(moveable, item, tgtIdx, true, src.index);
+    const srcIdx = moveable.indexOf(src.name);
+    if (srcIdx < 0) { renderAll(); return; }
+    let tgtIdx = moveable.indexOf(over.key);
+    if (tgtIdx < 0) tgtIdx = isNaN(over.idx) ? moveable.length - 1 : over.idx;
+
+    const item = moveable.splice(srcIdx, 1)[0];
+    let at = tgtIdx + (overBefore ? 0 : 1);
+    if (srcIdx < at) at--;
+    moveable.splice(Math.max(0, Math.min(moveable.length, at)), 0, item);
     sections = [...moveable, ...fixed];
+
     op      = { k: 'moveSection', name: item, index: moveable.indexOf(item) };
-    inverse = { k: 'moveSection', name: item, index: src.index };
+    inverse = { k: 'moveSection', name: item, index: srcIdx };
     label   = 'Reordered';
   }
 
   if (!op) { renderAll(); return; }
-  // The move is already applied locally, so only record and send it.
   renderAll();
   commit(op);
   undoStack.push({ label, forward: [op], inverse: [inverse] });
