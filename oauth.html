@@ -2,25 +2,54 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#faf8f5">
   <title>Signing in…</title>
+  <style>
+    html,body{height:100%;margin:0;background:#faf9f5}
+    @media (prefers-color-scheme: dark){html,body{background:#16151a}}
+  </style>
 </head>
 <body>
 <!--
-  Google bounces the silent token renewal back here with the new token in the
-  URL fragment. This page's only job is to hand it to the app and disappear.
-  It never renders anything: the renewal happens in a hidden iframe.
+  Google sends the renewed token back here in the URL fragment.
 
-  For this to work, this exact URL must be listed as an Authorized redirect URI
-  on the OAuth client in Google Cloud Console:
+  Two ways we get here:
+   • Top-level redirect (the normal path). We stash the token and bounce
+     straight back to the app — the whole trip is under a second and nothing
+     is ever clicked.
+   • Inside a hidden frame or popup. We hand the fragment to the opener.
+     Kept because it costs nothing, though Google now answers frames with
+     "interaction_required" when third-party cookies are blocked.
+
+  This exact URL must be an Authorized redirect URI on the OAuth client:
       https://rose-garden-pwa.vercel.app/oauth.html
 -->
 <script>
-  (function () {
-    var payload = { rg: 'oauth', hash: location.hash || '', search: location.search || '' };
-    try { (window.parent || window.opener).postMessage(payload, location.origin); } catch (e) {}
-    // If somebody lands here directly, don't leave them on a blank page.
-    if (window.parent === window && !window.opener) location.replace('/');
-  })();
+(function () {
+  var params = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  var token  = params.get('access_token');
+  var expIn  = Number(params.get('expires_in')) || 3600;
+  var framed = (window.parent && window.parent !== window) || !!window.opener;
+
+  if (framed) {
+    try {
+      (window.opener || window.parent).postMessage(
+        { rg: 'oauth', hash: location.hash || '', search: location.search || '' },
+        location.origin);
+    } catch (e) {}
+    return;
+  }
+
+  // Top-level: save and go home.
+  try {
+    if (token) {
+      localStorage.setItem('rg_access_token', token);
+      localStorage.setItem('rg_token_exp', String(Date.now() + expIn * 1000));
+    }
+  } catch (e) {}
+  location.replace(token ? '/' : '/?authfail=1');
+})();
 </script>
 </body>
 </html>

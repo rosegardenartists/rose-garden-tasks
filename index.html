@@ -813,12 +813,24 @@ window.addEventListener('load', async () => {
   if (!CLIENT_ID) { showPage('setupPage'); return; }
 
   accessToken = store.get('rg_access_token');
+  tokenExp = Number(store.get('rg_token_exp') || 0);
   const cached = store.get('rg_cache_md');
   const hasSignedInBefore = !!accessToken || !!cached;
 
   if (!hasSignedInBefore) { showPage('loginPage'); return; }
 
-  // 1. Straight to the list, from cache.
+  const failed = new URLSearchParams(location.search).get('authfail');
+  if (failed) history.replaceState({}, '', '/');
+  const triedRecently = Date.now() - Number(store.get(AUTH_TRY_KEY) || 0) < 60000;
+
+  /* Token's dead: hand the whole page to Google and come straight back with a
+     new one. This happens before anything is drawn, so opening the app looks
+     like opening the app rather than like logging in.
+     Skipped if Google just turned us away, or if we tried moments ago — that's
+     what stops it becoming a redirect loop. */
+  if (!tokenAlive(0) && !failed && !triedRecently && topLevelRenew()) return;
+
+  // Straight to the list, from the last copy we saw.
   showApp();
   if (cached) {
     try {
@@ -830,14 +842,16 @@ window.addEventListener('load', async () => {
     } catch (_) {}
   }
 
-  // 2. Quietly make sure the token is good, then pull the real thing.
-  const ok = await ensureToken();
-  if (!ok) {
-    // Don't shout yet — a renewal is armed for his next tap. Only complain if
-    // there's nothing at all to show.
+  if (!tokenAlive(0)) {
+    // Google wouldn't renew it quietly. Don't hammer it — show the chip and
+    // take the next tap as permission to try properly.
+    setAuthWarn(true);
+    renewOnNextGesture();
     if (!cached) showPage('loginPage');
     return;
   }
+
+  store.del(AUTH_TRY_KEY);
   scheduleRenew();
   loadTasks({ quiet: !!cached });
 });
@@ -897,6 +911,7 @@ function tokenAlive(margin = EXP_MARGIN_MS) {
 }
 
 function saveToken(resp) {
+  // Remembering the address lets Google skip the account chooser next time.
   accessToken = resp.access_token;
   const ttl = (Number(resp.expires_in) || 3600) * 1000;
   tokenExp = Date.now() + ttl;
@@ -928,13 +943,42 @@ async function getTokenClient() {
   return tokenClient;
 }
 
-/* Path 1 — genuinely invisible: a hidden iframe hitting Google's auth endpoint
-   with prompt=none. Google either bounces straight back to oauth.html with a
-   fresh token in the URL fragment, or refuses without showing anything.
+function authUrl() {
+  const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  u.searchParams.set('client_id', CLIENT_ID);
+  u.searchParams.set('redirect_uri', location.origin + '/oauth.html');
+  u.searchParams.set('response_type', 'token');
+  u.searchParams.set('scope', SCOPES);
+  u.searchParams.set('include_granted_scopes', 'true');
+  u.searchParams.set('prompt', 'none');
+  const email = store.get('rg_email');
+  if (email) u.searchParams.set('login_hint', email);
+  return u.toString();
+}
 
-   This needs `<origin>/oauth.html` registered as an Authorized redirect URI in
-   the Google Cloud console. If it isn't, this quietly fails and we fall through
-   to path 2 — so the app works either way, it's just less seamless. */
+/* Path 1 — the one that actually works. Send the whole page to Google with
+   prompt=none; it recognises the session, bounces straight back to oauth.html
+   with a fresh token, and oauth.html returns here. Under a second, nothing
+   clicked, nothing typed.
+
+   The obvious-looking alternative — doing the same in a hidden iframe — is a
+   dead end: Google answers frames with "interaction_required" because it can't
+   see its own cookies there under third-party cookie blocking. Verified against
+   the live app, not assumed. The iframe attempt is kept below only as a cheap
+   first try for browsers where it still works. */
+const AUTH_TRY_KEY = 'rg_auth_try';
+function topLevelRenew() {
+  // OAuth redirects need a real web origin. Opened from a file, there's nothing
+  // sensible to hand Google, so don't try.
+  if (!/^https?:$/.test(location.protocol)) return false;
+  const last = Number(store.get(AUTH_TRY_KEY) || 0);
+  if (Date.now() - last < 60000) return false;   // just tried and came back empty
+  store.set(AUTH_TRY_KEY, String(Date.now()));
+  location.replace(authUrl());
+  return true;
+}
+
+/* Path 2 — hidden iframe. Usually refused; costs ~1s to find out. */
 let SILENT_TIMEOUT_MS = 3500;   // a same-origin bounce is fast; don't stall the app
 function silentIframeRenew(timeout = SILENT_TIMEOUT_MS) {
   return new Promise(resolve => {
@@ -972,7 +1016,7 @@ function silentIframeRenew(timeout = SILENT_TIMEOUT_MS) {
   });
 }
 
-/* Path 2 — Google's own token client. It opens a popup even when asked not to
+/* Path 3 — Google's own token client. It opens a popup even when asked not to
    prompt, and browsers only allow popups during a real click, so this can only
    be used from inside a user gesture. With an active Google session the popup
    opens and closes on its own; nothing is typed. */
