@@ -291,6 +291,15 @@
     body.dnd-dragging, body.dnd-dragging * { cursor: grabbing !important; }
     body.dnd-dragging { -webkit-user-select: none; user-select: none; }
 
+    /* ─── SYNC STATUS ──────────────────────────────────────── */
+    .sync-dot {
+      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+      background: var(--done); margin-right: 2px; transition: background .2s;
+    }
+    .sync-dot.saving  { background: #d1a054; animation: syncPulse 1s ease-in-out infinite; }
+    .sync-dot.offline { background: var(--urgent); }
+    @keyframes syncPulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+
     /* ─── FAB ──────────────────────────────────────────────── */
     .fab {
       position: fixed; bottom: 24px; right: 20px;
@@ -422,6 +431,7 @@
     </div>
     <nav class="sb-nav" id="sidebarNav"></nav>
     <div class="sb-bottom">
+      <span class="sync-dot idle" id="syncDot" title="All changes saved"></span>
       <button class="icon-btn" onclick="loadTasks()" title="Sync (R)">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
       </button>
@@ -577,23 +587,30 @@ async function driveGet() {
     headers: { Authorization: `Bearer ${accessToken}` }
   });
   if (r.status === 401) { signIn(); return null; }
+  if (!r.ok) throw new Error('drive get ' + r.status);
   return r.text();
 }
+// Tiny probe — a few hundred bytes — so we can poll often without pulling the
+// whole file every time.
+async function driveVersion() {
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?fields=version,modifiedTime`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  if (r.status === 401) { signIn(); return null; }
+  if (!r.ok) throw new Error('drive meta ' + r.status);
+  const j = await r.json();
+  return String(j.version || j.modifiedTime || '');
+}
 async function drivePut(content) {
-  await fetch(`https://www.googleapis.com/upload/drive/v3/files/${FILE_ID}?uploadType=media`, {
+  const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${FILE_ID}?uploadType=media&fields=version`, {
     method: 'PATCH',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'text/plain' },
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'text/plain; charset=utf-8' },
     body: content
   });
-}
-function scheduleSave() {
-  pendingSave = true;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    const md = toMarkdown();
-    try { await drivePut(md); lastRemoteMd = md; }
-    finally { pendingSave = false; }
-  }, 800);
+  if (r.status === 401) { signIn(); return null; }
+  if (!r.ok) throw new Error('drive put ' + r.status);
+  const j = await r.json().catch(() => ({}));
+  return String(j.version || '');
 }
 
 // ── MARKDOWN ────────────────────────────────────────────────
@@ -629,11 +646,12 @@ function parseMd(md) {
   if (curTask && curSec) tsks[curSec].push(curTask);
   return { sections: secs, tasks: tsks };
 }
-function toMarkdown() {
+function toMarkdown(model) {
+  const m = model || { sections, tasks };
   let md = '# Tasks\n';
-  sections.forEach(sec => {
+  m.sections.forEach(sec => {
     md += `\n## ${sec}\n`;
-    (tasks[sec] || []).forEach(t => {
+    (m.tasks[sec] || []).forEach(t => {
       const note = t.note ? ` - ${t.note}` : '';
       md += `- ${t.checked ? '[x]' : '[ ]'} **${t.title}**${note}\n`;
       (t.subtasks || []).forEach(st => {
@@ -644,48 +662,299 @@ function toMarkdown() {
   return md.trimEnd() + '\n';
 }
 
-// ── LOAD ────────────────────────────────────────────────────
-let lastRemoteMd = null;   // last markdown we know is on Drive
-let pendingSave  = false;  // true while a local edit is waiting to be written
+/* ══════════════════════════════════════════════════════════════
+   SYNC ENGINE
 
+   One file on Google Drive is the single source of truth. Every device and
+   Claude read and write that same file.
+
+   The trick to making that safe is that we never blindly overwrite it. Each
+   thing you do is recorded as a small operation ("add task X to Personal",
+   "tick subtask Y"). To save, we pull the current file, replay our pending
+   operations onto it, and write the result. So if a task arrived from your
+   phone while you were typing on your laptop, both survive — last writer no
+   longer wins, both writers do.
+
+   Reads use a tiny version probe every few seconds, and only download the
+   file when the version actually changed.
+   ══════════════════════════════════════════════════════════════ */
+
+let baseMd      = null;   // file contents as we last saw them on Drive
+let baseVersion = null;   // Drive's version for baseMd
+let queue       = [];     // pending ops, oldest first
+let flushing    = false;
+let syncState   = 'idle'; // idle | saving | offline
+const QUEUE_KEY = 'rg_pending_ops';
+
+try { queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); } catch (_) { queue = []; }
+function persistQueue() {
+  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch (_) {}
+}
+
+function setSync(s) {
+  syncState = s;
+  const el = document.getElementById('syncDot');
+  if (!el) return;
+  el.className = 'sync-dot ' + s + (queue.length ? ' has-queue' : '');
+  el.title = s === 'saving'  ? 'Saving…'
+           : s === 'offline' ? `Offline — ${queue.length} change${queue.length === 1 ? '' : 's'} waiting`
+           : 'All changes saved';
+}
+
+// ── Op replay ───────────────────────────────────────────────
+function findTask(model, section, title) {
+  return (model.tasks[section] || []).find(t => t.title === title) || null;
+}
+function ensureSection(model, name) {
+  if (!model.tasks[name]) { model.tasks[name] = []; if (!model.sections.includes(name)) model.sections.push(name); }
+  return model.tasks[name];
+}
+
+function applyOp(model, op) {
+  switch (op.k) {
+    case 'addTask': {
+      const arr = ensureSection(model, op.section);
+      if (arr.some(t => t.title === op.title)) return;  // already there (replayed twice)
+      arr.unshift({ title: op.title, note: op.note || '', checked: false, subtasks: [], _from: null });
+      return;
+    }
+    case 'addSub': {
+      const t = findTask(model, op.section, op.title);
+      if (!t) return;
+      t.subtasks = t.subtasks || [];
+      if (t.subtasks.some(s => s.text === op.text)) return;
+      t.subtasks.push({ text: op.text, checked: false });
+      return;
+    }
+    case 'completeTask': {
+      const arr = model.tasks[op.section] || [];
+      const t = arr.find(x => x.title === op.title);
+      if (!t) return;
+      model.tasks[op.section] = arr.filter(x => x !== t);
+      t.checked = true; t._from = op.section;
+      ensureSection(model, 'Completed').unshift(t);
+      return;
+    }
+    case 'uncompleteTask': {
+      const arr = model.tasks['Completed'] || [];
+      const t = arr.find(x => x.title === op.title);
+      if (!t) return;
+      model.tasks['Completed'] = arr.filter(x => x !== t);
+      t.checked = false;
+      ensureSection(model, op.toSection).unshift(t);
+      return;
+    }
+    case 'promoteSub': {
+      const t = findTask(model, op.section, op.title);
+      if (t) t.subtasks = (t.subtasks || []).filter(s => s.text !== op.subText);
+      const done = ensureSection(model, 'Completed');
+      if (!done.some(x => x.title === op.completedTitle)) {
+        done.unshift({ title: op.completedTitle, note: '', checked: true, subtasks: [], _from: op.section });
+      }
+      return;
+    }
+    case 'moveTask': {
+      const from = model.tasks[op.from] || [];
+      const t = from.find(x => x.title === op.title);
+      if (!t) return;
+      model.tasks[op.from] = from.filter(x => x !== t);
+      const to = ensureSection(model, op.to);
+      to.splice(Math.max(0, Math.min(to.length, op.index)), 0, t);
+      return;
+    }
+    case 'moveSub': {
+      const t = findTask(model, op.section, op.title);
+      if (!t || !t.subtasks) return;
+      const s = t.subtasks.find(x => x.text === op.subText);
+      if (!s) return;
+      t.subtasks = t.subtasks.filter(x => x !== s);
+      t.subtasks.splice(Math.max(0, Math.min(t.subtasks.length, op.index)), 0, s);
+      return;
+    }
+    case 'moveSection': {
+      if (!model.sections.includes(op.name)) return;
+      const moveable = model.sections.filter(s => s !== 'Completed' && s !== op.name);
+      const fixed    = model.sections.filter(s => s === 'Completed');
+      moveable.splice(Math.max(0, Math.min(moveable.length, op.index)), 0, op.name);
+      model.sections = [...moveable, ...fixed];
+      return;
+    }
+  }
+}
+
+/* Self-healing.
+
+   Drive has no "only write if the file hasn't changed" option, so two devices
+   saving in the same instant can still race and one write can land on top of
+   the other. Rather than pretend that never happens, every device remembers
+   what it recently wrote. On each poll it checks that its own recent changes
+   are still in the file — if one went missing, it quietly puts it back. The
+   loser of a race repairs itself within a few seconds. */
+const HEAL_WINDOW_MS = 2 * 60 * 1000;
+let recentOps = [];
+
+function rememberOp(op) {
+  recentOps.push({ op, at: Date.now() });
+  const cut = Date.now() - HEAL_WINDOW_MS;
+  recentOps = recentOps.filter(r => r.at >= cut);
+}
+
+function opSatisfied(model, op) {
+  const inSec = (sec, title) => (model.tasks[sec] || []).some(t => t.title === title);
+  const done  = title => (model.tasks['Completed'] || []).some(t => t.title === title);
+  switch (op.k) {
+    case 'addTask':        return inSec(op.section, op.title) || done(op.title);
+    case 'addSub': {
+      const t = findTask(model, op.section, op.title);
+      if (t && (t.subtasks || []).some(s => s.text === op.text)) return true;
+      // It may have been ticked since, which moves it into Completed.
+      return (model.tasks['Completed'] || []).some(x => x.title.endsWith(') ' + op.text));
+    }
+    case 'completeTask':   return done(op.title);
+    case 'uncompleteTask': return !done(op.title);
+    case 'promoteSub':     return done(op.completedTitle);
+    case 'moveTask':       return inSec(op.to, op.title);
+    default:               return true;   // ordering ops aren't worth healing
+  }
+}
+
+// Returns the ops that vanished from the file and need re-applying.
+function findLostOps(model) {
+  const cut = Date.now() - HEAL_WINDOW_MS;
+  recentOps = recentOps.filter(r => r.at >= cut);
+  return recentOps.filter(r => !opSatisfied(model, r.op)).map(r => r.op);
+}
+
+// Every mutation goes through here: apply locally for an instant response,
+// record the op, then push it to Drive.
+function commit(op, opts = {}) {
+  queue.push(op);
+  persistQueue();
+  setSync('saving');
+  if (opts.now) flush();
+  else { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 400); }
+}
+
+function adoptModel(model, { render = true } = {}) {
+  sections = model.sections; tasks = model.tasks;
+  if (render) { renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect(); }
+}
+
+async function flush() {
+  if (flushing || !queue.length || !accessToken) return;
+  // Never re-render mid-drag — it would swap the DOM out from under the
+  // pointer and the drop would land in the wrong place.
+  if (dnd.active) { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 300); return; }
+  flushing = true;
+  clearTimeout(saveTimer);
+  setSync('saving');
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const v = await driveVersion();
+      if (v == null) return;
+      if (v !== baseVersion || baseMd == null) {
+        const md = await driveGet();
+        if (md == null) return;
+        baseMd = md; baseVersion = v;
+      }
+      const model = parseMd(baseMd);
+      migrateCheckedSubtasks(model);
+      const taken = queue.slice();
+      taken.forEach(op => applyOp(model, op));
+      const out = toMarkdown(model);
+
+      // Nobody else wrote in the meantime? Then this write is safe.
+      const check = await driveVersion();
+      if (check !== baseVersion) { baseVersion = check; continue; }
+
+      const newVersion = await drivePut(out);
+      baseMd = out;
+      baseVersion = newVersion || (await driveVersion());
+      queue = queue.slice(taken.length);
+      persistQueue();
+      taken.forEach(rememberOp);
+      adoptModel(model);
+      setSync(queue.length ? 'saving' : 'idle');
+      if (queue.length) { flushing = false; return flush(); }
+      // If our write landed on top of someone else's, the version will have
+      // jumped by more than one. Check the file again straight away so the
+      // healing pass can put back anything we trampled.
+      if (Number(newVersion) > Number(v) + 1) setTimeout(() => pollForChanges(true), 50);
+      return;
+    }
+    setSync('offline');
+  } catch (_) {
+    setSync('offline');
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flush, 5000);   // retry with a short backoff
+  } finally {
+    flushing = false;
+  }
+}
+
+// ── LOAD & POLL ─────────────────────────────────────────────
 async function loadTasks(opts = {}) {
   if (!opts.quiet) {
     document.getElementById('taskScroll').innerHTML = '<div class="load-st"><div class="spinner"></div></div>';
   }
-  const md = await driveGet();
-  if (md == null) return;
-  lastRemoteMd = md;
-  const p = parseMd(md);
-  sections = p.sections; tasks = p.tasks;
-  // Any subtask already ticked in the file gets promoted to Completed, so the
-  // app and the desktop dashboard agree on where finished subtasks live.
-  const migrated = migrateCheckedSubtasks();
-  renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
-  if (migrated) scheduleSave();
+  try {
+    const [md, v] = [await driveGet(), await driveVersion()];
+    if (md == null) return;
+    baseMd = md; baseVersion = v;
+    const model = parseMd(md);
+    // Subtasks already ticked in the file get promoted to Completed on sight,
+    // so the file looks the same no matter which device wrote it.
+    const migrated = migrateCheckedSubtasks(model);
+    adoptModel(model);
+    if (migrated) commit({ k: 'noop' }, { now: true });
+    if (queue.length) flush();
+    setSync(queue.length ? 'saving' : 'idle');
+  } catch (_) { setSync('offline'); }
 }
 
-// ── AUTO-REFRESH ────────────────────────────────────────────
-// Picks up items added from anywhere else — Claude, another device, the
-// desktop dashboard — without needing a manual refresh.
-const POLL_MS = 20000;
-async function pollForChanges() {
-  if (!accessToken || pendingSave || dnd.active) return;
-  if (document.getElementById('addSheet')?.classList.contains('open')) return;
-  let md;
-  try { md = await driveGet(); } catch (_) { return; }
-  if (md == null || md === lastRemoteMd) return;
-  lastRemoteMd = md;
-  const p = parseMd(md);
-  sections = p.sections; tasks = p.tasks;
-  const migrated = migrateCheckedSubtasks();
-  renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
-  if (migrated) scheduleSave();
-  toast('🔄 Updated');
+const POLL_MS = 4000;
+let polling = false;
+async function pollForChanges(force = false) {
+  if (polling || !accessToken) return;
+  if (!force) {
+    if (document.hidden) return;
+    if (dnd.active) return;
+    if (queue.length) return flush();        // our own writes take priority
+    if (document.getElementById('addSheet')?.classList.contains('open')) return;
+    if (document.querySelector('.sub-add.editing')) return;
+  }
+  polling = true;
+  try {
+    const v = await driveVersion();
+    if (v == null || v === baseVersion) { setSync(queue.length ? 'saving' : 'idle'); return; }
+    const md = await driveGet();
+    if (md == null) return;
+    baseMd = md; baseVersion = v;
+    const model = parseMd(md);
+    const migrated = migrateCheckedSubtasks(model);
+
+    // Put back anything of ours that a competing write knocked out.
+    const lost = findLostOps(model);
+    lost.forEach(op => applyOp(model, op));
+
+    adoptModel(model);
+    if (lost.length) {
+      lost.forEach(op => queue.push(op));
+      persistQueue();
+      flush();
+    } else if (migrated) {
+      commit({ k: 'noop' }, { now: true });
+    }
+    setSync(queue.length ? 'saving' : 'idle');
+    if (!lost.length) toast('🔄 Updated');
+  } catch (_) { setSync('offline'); }
+  finally { polling = false; }
 }
 setInterval(pollForChanges, POLL_MS);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) pollForChanges(); });
-window.addEventListener('focus', pollForChanges);
-window.addEventListener('online', pollForChanges);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { flush(); pollForChanges(); } });
+window.addEventListener('focus',  () => { flush(); pollForChanges(); });
+window.addEventListener('online', () => { flush(); pollForChanges(); });
+window.addEventListener('pagehide', () => { if (queue.length) flush(); });
 
 // ── SIDEBAR ─────────────────────────────────────────────────
 const DH = `<svg class="nav-dh" width="10" height="12" viewBox="0 0 10 12" fill="currentColor"><circle cx="3" cy="2" r="1.1"/><circle cx="7" cy="2" r="1.1"/><circle cx="3" cy="5.5" r="1.1"/><circle cx="7" cy="5.5" r="1.1"/><circle cx="3" cy="9" r="1.1"/><circle cx="7" cy="9" r="1.1"/></svg>`;
@@ -756,21 +1025,22 @@ function completedTitleFor(parentTask, subText) {
   const parent = cleanTitle(parentTask).replace(/[()]/g, '').trim();
   return `(${parent}) ${subText}`;
 }
-function promoteSubtask(parentTask, parentSection, sub) {
+function promoteSubtask(model, parentTask, parentSection, sub) {
   parentTask.subtasks = (parentTask.subtasks || []).filter(s => s !== sub);
-  if (!sections.includes('Completed')) sections.push('Completed');
-  if (!tasks['Completed']) tasks['Completed'] = [];
-  tasks['Completed'].unshift({
+  if (!model.sections.includes('Completed')) model.sections.push('Completed');
+  if (!model.tasks['Completed']) model.tasks['Completed'] = [];
+  model.tasks['Completed'].unshift({
     title: completedTitleFor(parentTask, sub.text),
     note: '', checked: true, subtasks: [], _from: parentSection || null
   });
 }
-// Runs once per load: anything already ticked in the file gets moved out.
-function migrateCheckedSubtasks() {
+// Runs on every load/poll: anything already ticked in the file gets moved out.
+function migrateCheckedSubtasks(model) {
+  const m = model || { sections, tasks };
   let moved = 0;
-  sections.filter(s => s !== 'Completed').forEach(sec => {
-    (tasks[sec] || []).forEach(t => {
-      (t.subtasks || []).filter(s => s.checked).forEach(s => { promoteSubtask(t, sec, s); moved++; });
+  m.sections.filter(s => s !== 'Completed').forEach(sec => {
+    (m.tasks[sec] || []).forEach(t => {
+      (t.subtasks || []).filter(s => s.checked).forEach(s => { promoteSubtask(m, t, sec, s); moved++; });
     });
   });
   return moved;
@@ -931,10 +1201,11 @@ function buildSubtasks(container, task, section) {
       item.style.opacity = '0.2';
       setTimeout(() => {
         expandedIds.add(section + '::' + task.title);
-        promoteSubtask(task, section, st);
+        const completedTitle = completedTitleFor(task, st.text);
+        promoteSubtask({ sections, tasks }, task, section, st);
         renderSidebar(); renderMobileTabs(); renderTasks();
         toast('✅ Moved to Completed');
-        scheduleSave();
+        commit({ k: 'promoteSub', section, title: task.title, subText: st.text, completedTitle });
       }, 150);
     });
     makeDraggable(item, 'subtask', { task, index: i }, '.sub-dh');
@@ -956,7 +1227,7 @@ function buildSubtasks(container, task, section) {
     add.classList.add('editing');
     input.focus();
   };
-  const commit = keepOpen => {
+  const saveSubtask = keepOpen => {
     const text = input.value.trim();
     if (!text) { add.classList.remove('editing'); return; }
     task.subtasks = task.subtasks || [];
@@ -965,7 +1236,7 @@ function buildSubtasks(container, task, section) {
     expandedIds.add(section + '::' + task.title);
     // Re-render straight away so the new subtask shows up without a refresh.
     renderSidebar(); renderMobileTabs(); renderTasks();
-    scheduleSave();
+    commit({ k: 'addSub', section, title: task.title, text }, { now: true });
     if (keepOpen) {
       const card = document.querySelector(`.task-card[data-dnd-sec="${CSS.escape(section)}"][data-dnd-idx="${(tasks[section]||[]).indexOf(task)}"]`);
       const nextInput = card?.querySelector('.sub-add-input');
@@ -977,10 +1248,10 @@ function buildSubtasks(container, task, section) {
   input.addEventListener('click', e => e.stopPropagation());
   input.addEventListener('keydown', e => {
     e.stopPropagation();
-    if (e.key === 'Enter')  { e.preventDefault(); commit(true); }
+    if (e.key === 'Enter')  { e.preventDefault(); saveSubtask(true); }
     if (e.key === 'Escape') { e.preventDefault(); input.value = ''; add.classList.remove('editing'); btn.focus(); }
   });
-  input.addEventListener('blur', () => { if (input.value.trim()) commit(false); else add.classList.remove('editing'); });
+  input.addEventListener('blur', () => { if (input.value.trim()) saveSubtask(false); else add.classList.remove('editing'); });
 
   container.appendChild(add);
 }
@@ -1004,7 +1275,9 @@ function toggleTask(task, section, cardEl) {
     }
     renderSidebar(); renderMobileTabs(); renderTasks();
     toast(task.checked ? '✅ Moved to Completed' : '↩ Moved back');
-    scheduleSave();
+    commit(task.checked
+      ? { k: 'completeTask',   section, title: task.title }
+      : { k: 'uncompleteTask', title: task.title, toSection: task._from || section });
   }, 150);
 }
 
@@ -1039,7 +1312,7 @@ function submitAdd() {
   if (!['All','🚨 Urgent','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
   else { renderSidebar(); renderMobileTabs(); renderTasks(); }
   toast(`Added to ${section}`);
-  scheduleSave();
+  commit({ k: 'addTask', section, title: full, note: '' }, { now: true });
 }
 document.getElementById('addTitle').addEventListener('keydown', e => {
   if (e.key === 'Enter') submitAdd();
@@ -1234,6 +1507,8 @@ function performDrop({ type, src, overEl, overBefore }) {
     arr.splice(Math.max(0, Math.min(arr.length, at)), 0, item);
   };
 
+  let op = null;
+
   if (type === 'task') {
     const tgtSec = overEl.dataset.dndSec;
     const tgtIdx = parseInt(overEl.dataset.dndIdx);
@@ -1244,6 +1519,7 @@ function performDrop({ type, src, overEl, overBefore }) {
     if (srcIdx < 0) return;
     const item = srcArr.splice(srcIdx, 1)[0];
     place(tasks[tgtSec], item, tgtIdx, src.section === tgtSec, srcIdx);
+    op = { k: 'moveTask', title: item.title, from: src.section, to: tgtSec, index: tasks[tgtSec].indexOf(item) };
 
   } else if (type === 'subtask') {
     const arr = src.task.subtasks || [];
@@ -1253,6 +1529,8 @@ function performDrop({ type, src, overEl, overBefore }) {
     if (srcIdx < 0 || srcIdx >= arr.length) return;
     const item = arr.splice(srcIdx, 1)[0];
     place(arr, item, tgtIdx, true, srcIdx);
+    const parentSec = sections.find(s => (tasks[s] || []).includes(src.task));
+    op = { k: 'moveSub', section: parentSec, title: src.task.title, subText: item.text, index: arr.indexOf(item) };
 
   } else if (type === 'section') {
     const moveable = sections.filter(s => s !== 'Completed');
@@ -1262,10 +1540,11 @@ function performDrop({ type, src, overEl, overBefore }) {
     const item = moveable.splice(src.index, 1)[0];
     place(moveable, item, tgtIdx, true, src.index);
     sections = [...moveable, ...fixed];
+    op = { k: 'moveSection', name: item, index: moveable.indexOf(item) };
   }
 
   renderSidebar(); renderMobileTabs(); renderTasks();
-  scheduleSave();
+  if (op) commit(op);
 }
 </script>
 </body>
