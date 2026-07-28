@@ -484,6 +484,20 @@
     }
     :root[data-theme="dark"] .toast-btn { color: #ffb894; }
 
+    /* ─── RECONNECT CHIP ───────────────────────────────────── */
+    .auth-warn {
+      position: fixed; left: 50%; transform: translateX(-50%) translateY(-8px);
+      top: calc(10px + env(safe-area-inset-top)); z-index: 11500;
+      display: none; align-items: center; gap: 8px;
+      font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+      background: var(--urgent); color: #fff; border: none;
+      border-radius: 999px; padding: 8px 15px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.25);
+      opacity: 0; transition: opacity .2s var(--ease), transform .2s var(--ease);
+    }
+    .auth-warn.show { display: flex; opacity: 1; transform: translateX(-50%) translateY(0); }
+    .aw-dot { width: 7px; height: 7px; border-radius: 50%; background: #fff; opacity: .85; }
+
     /* ─── SETTINGS KEYS ────────────────────────────────────── */
     .s-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 14px;
       margin-top: 22px; font-size: 12px; color: var(--text2); }
@@ -761,6 +775,11 @@
   </div>
 </div>
 
+<!-- RECONNECT (only if a silent token renewal fails) -->
+<button class="auth-warn" id="authWarn" onclick="reconnect()" type="button">
+  <span class="aw-dot"></span> Reconnect to Google
+</button>
+
 <!-- TOAST -->
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
@@ -777,12 +796,47 @@ let expandedIds = new Set();
 let searchQuery = '';
 let saveTimer   = null;
 
-// ── INIT ────────────────────────────────────────────────────
-window.addEventListener('load', () => {
+/* ── INIT ────────────────────────────────────────────────────
+   Opening the app should show the list, not a spinner and not a login screen.
+   So: paint immediately from the last known copy of the file, then renew the
+   token quietly in the background and refresh. If he's been away long enough
+   for the token to have died, he sees his tasks the whole time it's renewing. */
+window.addEventListener('load', async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
-  const tok = localStorage.getItem('rg_access_token');
-  if (tok && CLIENT_ID) { accessToken = tok; showApp(); loadTasks(); }
-  else if (!CLIENT_ID) showPage('setupPage');
+  if (!CLIENT_ID) { showPage('setupPage'); return; }
+
+  accessToken = localStorage.getItem('rg_access_token');
+  const cached = localStorage.getItem('rg_cache_md');
+  const hasSignedInBefore = !!accessToken || !!cached;
+
+  if (!hasSignedInBefore) { showPage('loginPage'); return; }
+
+  // 1. Straight to the list, from cache.
+  showApp();
+  if (cached) {
+    try {
+      const model = parseMd(cached);
+      migrateCheckedSubtasks(model);
+      sections = model.sections; tasks = model.tasks;
+      renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
+      baseMd = cached;
+    } catch (_) {}
+  }
+
+  // 2. Quietly make sure the token is good, then pull the real thing.
+  const ok = await ensureToken();
+  if (!ok) {
+    setAuthWarn(true);
+    if (!cached) showPage('loginPage');
+    return;
+  }
+  scheduleRenew();
+  loadTasks({ quiet: !!cached });
+});
+
+// Coming back to the app after a while: renew before doing anything else.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && accessToken && !tokenAlive()) ensureToken();
 });
 
 // ── PAGES ───────────────────────────────────────────────────
@@ -808,57 +862,164 @@ function saveSetup() {
   showPage('loginPage');
 }
 
-// ── AUTH ────────────────────────────────────────────────────
-function signIn() {
-  if (!CLIENT_ID) { showPage('setupPage'); return; }
-  google.accounts.oauth2.initTokenClient({
-    client_id: CLIENT_ID, scope: SCOPES,
-    callback: resp => {
-      if (resp.error) {
-        const el = document.getElementById('loginErr');
-        el.textContent = resp.error; el.style.display = 'block'; return;
-      }
-      accessToken = resp.access_token;
-      localStorage.setItem('rg_access_token', accessToken);
-      showApp(); loadTasks();
-    }
-  }).requestAccessToken();
+/* ══════════════════════════════════════════════════════════════
+   AUTH
+
+   Google hands browser apps an access token that dies after about an hour, and
+   it does not give refresh tokens to public clients like this one. So the token
+   WILL expire — the job is to renew it without Ethan noticing.
+
+   Google Identity Services can do a silent renewal: asking for a token with
+   `prompt: ''` reuses the existing Google session in a hidden frame and comes
+   back with a fresh token, no clicking, as long as he's still signed in to
+   Google somewhere and has already granted access once.
+
+   So: remember when the token expires, renew it a few minutes early, renew on
+   opening the app, and renew-and-retry if a request ever 401s. Only if a silent
+   renewal genuinely fails does he see anything — and then it's a small
+   "Reconnect" chip on the same screen, not a bounce back to the login page.
+   ══════════════════════════════════════════════════════════════ */
+let tokenClient  = null;
+let tokenExp     = Number(localStorage.getItem('rg_token_exp') || 0);
+let tokenPromise = null;
+const EXP_MARGIN_MS = 5 * 60 * 1000;   // renew this long before it actually dies
+
+function tokenAlive(margin = EXP_MARGIN_MS) {
+  return !!accessToken && tokenExp > Date.now() + margin;
 }
+
+function saveToken(resp) {
+  accessToken = resp.access_token;
+  const ttl = (Number(resp.expires_in) || 3600) * 1000;
+  tokenExp = Date.now() + ttl;
+  localStorage.setItem('rg_access_token', accessToken);
+  localStorage.setItem('rg_token_exp', String(tokenExp));
+  setAuthWarn(false);
+  scheduleRenew();
+}
+
+// The GIS script loads async — don't assume it's there yet.
+function gisReady(timeout = 8000) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    (function poll() {
+      if (window.google?.accounts?.oauth2) return resolve();
+      if (Date.now() - t0 > timeout) return reject(new Error('gis-timeout'));
+      setTimeout(poll, 100);
+    })();
+  });
+}
+
+async function getTokenClient() {
+  await gisReady();
+  if (!tokenClient) {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID, scope: SCOPES, callback: () => {},
+    });
+  }
+  return tokenClient;
+}
+
+/* interactive:false = silent. Resolves true if we ended up with a live token. */
+async function ensureToken({ interactive = false, force = false } = {}) {
+  if (!CLIENT_ID) { showPage('setupPage'); return false; }
+  if (!force && tokenAlive()) return true;
+  if (tokenPromise) return tokenPromise;
+
+  tokenPromise = (async () => {
+    try {
+      const client = await getTokenClient();
+      return await new Promise(resolve => {
+        const done = ok => { clearTimeout(bail); resolve(ok); };
+        const bail = setTimeout(() => done(false), interactive ? 120000 : 12000);
+        client.callback = resp => {
+          if (resp && resp.access_token) { saveToken(resp); done(true); }
+          else done(false);
+        };
+        client.error_callback = () => done(false);
+        // '' asks Google to reuse the existing session with no UI.
+        try { client.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
+        catch (_) { done(false); }
+      });
+    } catch (_) { return false; }
+    finally { tokenPromise = null; }
+  })();
+  return tokenPromise;
+}
+
+let renewTimer = null;
+function scheduleRenew() {
+  clearTimeout(renewTimer);
+  const wait = Math.max(30000, tokenExp - Date.now() - EXP_MARGIN_MS);
+  renewTimer = setTimeout(() => ensureToken({ force: true }), wait);
+}
+
+/* Wraps a Drive call: make sure we have a token, and if the call still comes
+   back 401 (revoked, clock skew, whatever) renew once and try again. */
+async function authed(fn) {
+  if (!tokenAlive(0)) {
+    const ok = await ensureToken();
+    if (!ok) { setAuthWarn(true); throw new Error('no-token'); }
+  }
+  let r = await fn();
+  if (r && r.status === 401) {
+    const ok = await ensureToken({ force: true });
+    if (!ok) { setAuthWarn(true); throw new Error('no-token'); }
+    r = await fn();
+  }
+  return r;
+}
+
+// A quiet chip rather than throwing him back to a login screen.
+function setAuthWarn(on) {
+  const el = document.getElementById('authWarn');
+  if (el) el.classList.toggle('show', !!on);
+}
+async function reconnect() {
+  setAuthWarn(false);
+  const ok = await ensureToken({ interactive: true, force: true });
+  if (ok) { showApp(); loadTasks(); } else setAuthWarn(true);
+}
+
+function signIn() { reconnect(); }
+
 function signOut() {
   if (accessToken) google.accounts.oauth2.revoke(accessToken, () => {});
   localStorage.removeItem('rg_access_token');
-  accessToken = null; sections = []; tasks = {};
+  localStorage.removeItem('rg_token_exp');
+  localStorage.removeItem('rg_cache_md');
+  clearTimeout(renewTimer);
+  accessToken = null; tokenExp = 0; sections = []; tasks = {};
   document.getElementById('settingsOv').classList.remove('open');
   showPage('loginPage');
 }
 
 // ── DRIVE ───────────────────────────────────────────────────
 async function driveGet() {
-  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?alt=media`, {
+  const r = await authed(() => fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?alt=media`, {
     headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  if (r.status === 401) { signIn(); return null; }
+  }));
   if (!r.ok) throw new Error('drive get ' + r.status);
-  return r.text();
+  const text = await r.text();
+  try { localStorage.setItem('rg_cache_md', text); } catch (_) {}
+  return text;
 }
 // Tiny probe — a few hundred bytes — so we can poll often without pulling the
 // whole file every time.
 async function driveVersion() {
-  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?fields=version,modifiedTime`, {
+  const r = await authed(() => fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?fields=version,modifiedTime`, {
     headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  if (r.status === 401) { signIn(); return null; }
+  }));
   if (!r.ok) throw new Error('drive meta ' + r.status);
   const j = await r.json();
   return String(j.version || j.modifiedTime || '');
 }
 async function drivePut(content) {
-  const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${FILE_ID}?uploadType=media&fields=version`, {
+  const r = await authed(() => fetch(`https://www.googleapis.com/upload/drive/v3/files/${FILE_ID}?uploadType=media&fields=version`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'text/plain; charset=utf-8' },
     body: content
-  });
-  if (r.status === 401) { signIn(); return null; }
+  }));
   if (!r.ok) throw new Error('drive put ' + r.status);
   const j = await r.json().catch(() => ({}));
   return String(j.version || '');
@@ -1364,7 +1525,17 @@ async function loadTasks(opts = {}) {
     if (queue.length) flush();
     setSync(queue.length ? 'saving' : 'idle');
     drainInbox();
-  } catch (_) { setSync('offline'); }
+  } catch (e) {
+    setSync('offline');
+    // If the spinner is still up and we have nothing to show, fall back to the
+    // cached copy rather than an empty screen.
+    if (!sections.length) {
+      const cached = localStorage.getItem('rg_cache_md');
+      if (cached) { const m = parseMd(cached); migrateCheckedSubtasks(m); adoptModel(m); }
+      else document.getElementById('taskScroll').innerHTML = emptyState();
+    }
+    if (String(e.message).includes('no-token')) setAuthWarn(true);
+  }
 }
 
 /* ── CLAUDE INBOX ────────────────────────────────────────────
