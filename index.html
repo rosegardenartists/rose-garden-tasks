@@ -408,7 +408,12 @@
     /* ─── SELECTION & MOTION ───────────────────────────────── */
     .task-card { transition: box-shadow .15s var(--ease), opacity .2s var(--ease), transform .18s var(--ease), border-color .15s; }
     .task-card.selected { box-shadow: 0 0 0 2px var(--ring); border-color: transparent; }
-    .task-card.vanishing { opacity: 0; transform: scale(.97); }
+    .task-card.vanishing { animation: completeOut .18s var(--ease) forwards; pointer-events: none; }
+    @keyframes completeOut {
+      0%   { opacity: 1; transform: none; }
+      40%  { opacity: 1; transform: scale(.995); }
+      100% { opacity: 0; transform: scale(.97); }
+    }
     /* Only cards that are genuinely new animate in. Animating on every render
        made the whole list shimmer each time a save or a sync came back. */
     #taskScroll .task-card.fresh { animation: cardIn .18s var(--ease) both; }
@@ -483,6 +488,15 @@
       padding: 2px 2px; flex-shrink: 0;
     }
     :root[data-theme="dark"] .toast-btn { color: #ffb894; }
+
+    /* A row in Urgent that stands for a subtask living somewhere else. */
+    .task-card.proxy-row .dh,
+    .task-card.proxy-row .expand-btn { display: none; }
+    .sub-text.urgent { color: var(--urgent); font-weight: 600; }
+    .sub-flag { width: 22px; height: 22px; font-size: 12px; flex-shrink: 0; opacity: 0; }
+    .sub-item:hover .sub-flag { opacity: 1; }
+    .sub-flag.on { opacity: 1; }
+    @media (hover: none) { .sub-flag { opacity: .4; } .sub-flag.on { opacity: 1; } }
 
     /* ─── QUICK FLAGS ──────────────────────────────────────── */
     /* Same manners as the drag handle and ⋯ : out of the way until you go
@@ -605,6 +619,13 @@
     .sheet-urgent input { width: 17px; height: 17px; cursor: pointer; accent-color: var(--urgent); }
     .sheet-sub { width: 100%; padding: 14px; background: var(--accent); color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background .15s; }
     .sheet-sub:hover { background: var(--accent-dk); }
+    /* A stray backdrop click while typing gets a small refusal, not a dismissal. */
+    .sheet.nudge { animation: sheetNudge .22s var(--ease); }
+    @keyframes sheetNudge {
+      0%,100% { transform: translateX(0) }
+      30% { transform: translateX(-5px) }
+      65% { transform: translateX(4px) }
+    }
 
     /* ─── TOAST ────────────────────────────────────────────── */
     .toast {
@@ -1265,7 +1286,12 @@ function parseMd(md) {
       continue;
     }
     if (curTask && /^\s+- \[[ xX]\]/.test(line)) {
-      curTask.subtasks.push({ text: line.replace(/^\s+- \[[ xX]\]\s*/, ''), checked: /\[[xX]\]/.test(line) });
+      let text = line.replace(/^\s+- \[[ xX]\]\s*/, '');
+      // A subtask carries urgency the same way a task does: in its own text.
+      const URG = /^(?:\u{1F6A8}\s*)?URGENT:\s*/iu;
+      const urgent = URG.test(text);
+      if (urgent) text = text.replace(URG, '');
+      curTask.subtasks.push({ text, urgent, checked: /\[[xX]\]/.test(line) });
       continue;
     }
     if (curTask && /^\s+- /.test(line)) {
@@ -1285,7 +1311,8 @@ function toMarkdown(model) {
       const due  = t.due ? ` @${t.due}` : '';
       md += `- ${t.checked ? '[x]' : '[ ]'} **${t.title}**${note}${due}\n`;
       (t.subtasks || []).forEach(st => {
-        md += `  - ${st.checked ? '[x]' : '[ ]'} ${st.text}\n`;
+        const mark = st.urgent ? '🚨 URGENT: ' : '';
+        md += `  - ${st.checked ? '[x]' : '[ ]'} ${mark}${st.text}\n`;
       });
     });
   });
@@ -1459,7 +1486,14 @@ function applyOp(model, op) {
       const t = findTask(model, op.section, op.title);
       if (!t) return;
       const s = (t.subtasks || []).find(x => x.text === op.from);
-      if (s) s.text = op.text;
+      if (s) { s.text = op.text; if ('urgent' in op) s.urgent = !!op.urgent; }
+      return;
+    }
+    case 'subUrgent': {
+      const t = findTask(model, op.section, op.title);
+      if (!t) return;
+      const s = (t.subtasks || []).find(x => x.text === op.text);
+      if (s) s.urgent = !!op.urgent;
       return;
     }
     case 'deleteSub': {
@@ -1570,6 +1604,11 @@ function opSatisfied(model, op) {
       const t = findTask(model, op.section, op.title);
       return !t || !(t.subtasks || []).some(s => s.text === op.text);
     }
+    case 'subUrgent': {
+      const t = findTask(model, op.section, op.title);
+      const sub = t && (t.subtasks || []).find(x => x.text === op.text);
+      return !sub || !!sub.urgent === !!op.urgent;
+    }
     case 'addSection':     return model.sections.includes(op.name);
     case 'deleteSection':  return !model.sections.includes(op.name);
     case 'restoreTask':    return inSec(op.section, op.task.title);
@@ -1654,11 +1693,18 @@ function commit(op, opts = {}) {
    — which is the normal case after our own save round-trips — don't touch the
    DOM at all. Re-rendering identical content was the main source of flicker. */
 function adoptModel(model, { render = true } = {}) {
-  const before = render ? toMarkdown() : null;
+  /* Compare BEFORE swapping, and if the file says exactly what we already have,
+     keep the objects we've got.
+
+     Swapping first was a real bug: a save round-trip replaced every task object
+     with a freshly parsed one, then skipped the render because nothing looked
+     different. Every card on screen was still holding a pointer to the old
+     objects, so its menu, its checkbox and its flags all quietly did nothing —
+     `indexOf` couldn't find the task any more. That is the "sometimes clicking
+     does nothing" glitch. */
+  if (render && toMarkdown(model) === toMarkdown()) return false;
   sections = model.sections; tasks = model.tasks;
   if (!render) return false;
-  const after = toMarkdown();
-  if (after === before) return false;          // nothing visibly changed
   renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
   return true;
 }
@@ -1916,7 +1962,7 @@ function renderSidebar() {
   // Static top items
   const todayN    = openTasks(t => t.due && dayDiff(t.due) <= 0).length;
   const upcomingN = openTasks(t => t.due && dayDiff(t.due) > 0).length;
-  const urgentN   = openTasks(isUrgent).length;
+  const urgentN   = openTasks(isUrgent).length + urgentSubtaskRows().length;
   const overdueN  = openTasks(t => t.due && isOverdue(t.due)).length;
   [['All Tasks','All',null],
    ['☀️ Today','Today',todayN],
@@ -2101,12 +2147,39 @@ function openTasks(fn) {
   return out;
 }
 
+/* An urgent subtask breaks out of its parent and stands on its own in the
+   Urgent list, labelled with where it came from: [Parent Task] the subtask.
+   It is a view, not a copy - ticking it there ticks the real subtask. */
+const proxyCache = new Map();
+
+function urgentSubtaskRows() {
+  const rows = [];
+  sections.filter(s => s !== 'Completed').forEach(sec => {
+    (tasks[sec] || []).forEach(parent => {
+      if (parent.checked) return;
+      (parent.subtasks || []).forEach(sub => {
+        if (!sub.urgent || sub.checked) return;
+        const id = sec + '\u0001' + parent.title + '\u0001' + sub.text;
+        const title = `[${cleanTitle(parent).trim()}] ${sub.text}`;
+        let proxy = proxyCache.get(id);
+        if (!proxy || proxy.title !== title) {
+          proxy = { title, note: '', due: null, checked: false, subtasks: [],
+                    _proxyOf: { parentTitle: parent.title, section: sec, subText: sub.text } };
+          proxyCache.set(id, proxy);
+        }
+        rows.push({ sec, task: proxy });
+      });
+    });
+  });
+  return rows;
+}
+
 function getItems() {
   let items = [];
   if (activeTab === 'All') {
     items = openTasks(() => true);
   } else if (activeTab === '🚨 Urgent') {
-    items = openTasks(isUrgent);
+    items = [...openTasks(isUrgent), ...urgentSubtaskRows()];
   } else if (activeTab === 'Today') {
     items = openTasks(t => t.due && dayDiff(t.due) <= 0)
       .sort((a, b) => a.task.due.localeCompare(b.task.due));
@@ -2235,6 +2308,23 @@ function toggleUrgent(task, section) {
   haptic();
 }
 
+function resolveProxy(proxy) {
+  const p = proxy._proxyOf;
+  if (!p) return null;
+  const parent = (tasks[p.section] || []).find(t => t.title === p.parentTitle);
+  const sub = parent && (parent.subtasks || []).find(x => x.text === p.subText);
+  return sub ? { parent, sub, section: p.section } : null;
+}
+
+function toggleSubUrgent(parent, section, sub) {
+  const on = !sub.urgent;
+  haptic();
+  perform(on ? '🚨 Subtask urgent' : 'Urgent removed',
+    [{ k: 'subUrgent', section, title: parent.title, text: sub.text, urgent: on }],
+    [{ k: 'subUrgent', section, title: parent.title, text: sub.text, urgent: !on }],
+    { now: true });
+}
+
 function toggleQuickDue(task, section, which) {
   const target = which === 'today' ? todayStr(0) : todayStr(1);
   const already = (task.due || null) === target;
@@ -2284,8 +2374,10 @@ function startEditTask(task, section, card) {
   body.style.cursor = 'default';
   titleIn.focus(); titleIn.select();
 
+  openEditor();
   let closed = false;
-  const cancel = () => { if (closed) return; closed = true; body.innerHTML = prevHTML; renderTasks(); };
+  const flushHeld = () => closeEditor();
+  const cancel = () => { if (closed) return; closed = true; closeEditor(); body.innerHTML = prevHTML; renderTasks(); };
   const save = () => {
     if (closed) return;
     const newTitle = titleIn.value.trim();
@@ -2293,6 +2385,7 @@ function startEditTask(task, section, card) {
     const newDue   = dueVal || null;
     if (!newTitle) { titleIn.focus(); return; }
     closed = true;
+    closeEditor();
     const oldTitle = task.title, oldNote = task.note || '', oldDue = task.due || null;
     if (newTitle === oldTitle && newNote === oldNote && newDue === oldDue) { renderTasks(); return; }
     renameExpandedKey(section, oldTitle, newTitle);
@@ -2371,22 +2464,121 @@ function taskMenu(btn, task, section, card) {
 // ── RENDER TASKS ─────────────────────────────────────────────
 let renderedKeys = new Set();   // what was on screen last time, so only new cards animate
 
+/* Everything that decides how a card looks. If this hasn't changed, the card on
+   screen is already correct and can be left exactly as it is. */
+function cardSignature(task, section, expanded) {
+  // Only what actually changes the card. Using activeTab here was wrong: it made
+  // every card rebuild on any tab switch, when the view only alters one badge.
+  const showsSectionBadge = ['Today', 'Upcoming'].includes(activeTab) ? 1 : 0;
+  return [section, task.title, task.note || '', task.due || '', task.checked ? 1 : 0,
+          expanded ? 1 : 0, showsSectionBadge,
+          (task.subtasks || []).map(s => (s.urgent ? '!' : '') + s.text).join('\u0001')].join('\u0002');
+}
+
+/* Card reuse.
+
+   The list used to be torn down with innerHTML='' and rebuilt from scratch on
+   every change - 47 cards, ~2,000 nodes and ~300 event listeners, about 70ms of
+   blocked main thread for a change that usually affects a single row. That was
+   the lag.
+
+   Now unchanged cards are moved into place instead of rebuilt, so a typical
+   action touches one card rather than all of them. Reuse needs BOTH the same
+   task object and the same signature: once a sync replaces the model with fresh
+   objects, identity breaks and the cards rebuild - which is right, because the
+   old cards' handlers still close over the old objects. */
+let cardPool = new Map();
+let lastLayoutSig = null;
+
+function cardFor(task, section) {
+  const key = section + '::' + task.title;
+  const expanded = expandedIds.has(key);
+  const sig = cardSignature(task, section, expanded);
+  const existing = cardPool.get(key);
+
+  if (existing && existing.__task === task && existing.dataset.sig === sig) {
+    cardPool.delete(key);
+    existing.classList.remove('fresh');
+    existing.classList.toggle('selected', selectedKey === key);
+    const idx = (tasks[section] || []).indexOf(task);
+    if (existing.dataset.dndIdx !== String(idx)) existing.dataset.dndIdx = String(idx);
+    freshCheck(key);
+    return existing;
+  }
+
+  const card = makeCard(task, section);
+  card.__task = task;
+  card.dataset.cardKey = key;
+  card.dataset.sig = sig;
+  return card;
+}
+
+let renderQueued = false;
+let editorsOpen = 0;
+
+/* Anything half-typed is sacred: while an inline editor is open, renders are
+   held rather than rebuilding the card out from under it.
+
+   This counts explicitly rather than looking for the editor in the DOM. Asking
+   the DOM deadlocks — the editor is only cleared by a render, so "is an editor
+   open?" would stay true forever and nothing would ever repaint again. */
+function editingInPlace() { return editorsOpen > 0; }
+function openEditor()  { editorsOpen++; }
+function closeEditor() {
+  editorsOpen = Math.max(0, editorsOpen - 1);
+  if (editorsOpen === 0 && renderQueued) { renderQueued = false; renderAll(); }
+}
+
 function renderTasks() {
   const scroll = document.getElementById('taskScroll');
+  if (editingInPlace()) { renderQueued = true; return; }
   const savedTop = scroll.scrollTop; // preserve scroll!
   const wasRendered = renderedKeys;
   renderedKeys = new Set();
   freshCheck = key => {
+    const isNew = wasRendered.size > 0 && !wasRendered.has(key);
     renderedKeys.add(key);
-    return wasRendered.size > 0 && !wasRendered.has(key);
+    return isNew;
   };
-  scroll.innerHTML = '';
 
   const items = getItems();
-  if (!items.length) {
-    scroll.innerHTML = emptyState();
+
+  /* Cheapest possible render: work out what the list *should* look like, and if
+     that is what is already on screen, touch nothing at all.
+
+     Even with card reuse, swapping the children forces a full re-layout of
+     ~2,000 nodes, which cost ~36ms per render. Most renders change nothing
+     visible - a save coming back, an unrelated action - so the fastest thing to
+     do is recognise that and stop. */
+  const plan = items.map(({ task, sec }) => {
+    const key = sec + '::' + task.title;
+    return key + '\u0003' + cardSignature(task, sec, expandedIds.has(key));
+  }).join('\u0004');
+  const layoutSig = activeTab + '\u0005' + searchQuery + '\u0005' + plan;
+
+  if (layoutSig === lastLayoutSig && scroll.querySelector('.task-card')) {
+    items.forEach(({ task, sec }) => renderedKeys.add(sec + '::' + task.title));
+    // The entry animation has already played; clear the marker so nothing is
+    // left looking "new".
+    scroll.querySelectorAll('.task-card.fresh').forEach(el => el.classList.remove('fresh'));
+    if (selectedKey) highlightSelected();
     return;
   }
+  lastLayoutSig = layoutSig;
+
+  // Cards already on screen, available for reuse rather than rebuilding.
+  cardPool = new Map();
+  scroll.querySelectorAll('.task-card').forEach(el => {
+    if (el.dataset.cardKey) cardPool.set(el.dataset.cardKey, el);
+  });
+  if (!items.length) {
+    scroll.replaceChildren();
+    scroll.insertAdjacentHTML('afterbegin', emptyState());
+    cardPool.clear();
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
 
   const group = (keyOf, labelOf) => {
     const buckets = new Map();
@@ -2400,8 +2592,8 @@ function renderTasks() {
       const lbl = document.createElement('div'); lbl.className = 'sec-label';
       lbl.innerHTML = `${esc(labelOf(k, its))}<span class="sec-count">${its.length}</span>`;
       g.appendChild(lbl);
-      its.forEach(({ task, sec }) => g.appendChild(makeCard(task, sec)));
-      scroll.appendChild(g);
+      its.forEach(({ task, sec }) => g.appendChild(cardFor(task, sec)));
+      frag.appendChild(g);
     });
   };
 
@@ -2416,8 +2608,13 @@ function renderTasks() {
   } else if (['All', '🚨 Urgent'].includes(activeTab)) {
     group(it => it.sec, k => k);
   } else {
-    items.forEach(({ task, sec }) => scroll.appendChild(makeCard(task, sec)));
+    items.forEach(({ task, sec }) => frag.appendChild(cardFor(task, sec)));
   }
+
+  // One swap. Reused cards move across with their listeners intact; whatever is
+  // left in the pool was on screen and no longer belongs, so it is dropped.
+  scroll.replaceChildren(frag);
+  cardPool.clear();
 
   scroll.scrollTop = savedTop; // restore scroll!
   if (selectedKey) highlightSelected();
@@ -2509,6 +2706,63 @@ function makeCard(task, section) {
     toggleTask(task, section, card);
   });
 
+  /* A row in the Urgent list that stands for a subtask: everything on it has to
+     act on the real subtask, not on the stand-in object. */
+  if (task._proxyOf) {
+    card.classList.add('proxy-row');
+    card.querySelectorAll('.flag[data-flag="today"], .flag[data-flag="tomorrow"]').forEach(b => b.remove());
+    const cb = card.querySelector('.cb');
+    cb.replaceWith(cb.cloneNode(true));
+    card.querySelector('.cb').addEventListener('click', e => {
+      e.stopPropagation();
+      const r = resolveProxy(task);
+      if (!r) { renderAll(); return; }
+      haptic();
+      card.classList.add('vanishing');
+      const completedTitle = completedTitleFor(r.parent, r.sub.text);
+      const at = (r.parent.subtasks || []).indexOf(r.sub);
+      setTimeout(() => perform('✅ Moved to Completed',
+        [{ k: 'promoteSub', section: r.section, title: r.parent.title, subText: r.sub.text, completedTitle }],
+        [{ k: 'demoteSub',  section: r.section, title: r.parent.title, subText: r.sub.text, completedTitle, index: at },
+         { k: 'subUrgent',  section: r.section, title: r.parent.title, text: r.sub.text, urgent: true }]), 170);
+    });
+    const uflag = card.querySelector('.flag[data-flag="urgent"]');
+    uflag?.addEventListener('pointerdown', e => e.stopPropagation());
+    uflag?.addEventListener('click', e => {
+      e.stopPropagation();
+      const r = resolveProxy(task);
+      if (r) toggleSubUrgent(r.parent, r.section, r.sub);
+    });
+    const more = card.querySelector('.more-btn');
+    more.addEventListener('pointerdown', e => e.stopPropagation());
+    more.addEventListener('click', e => {
+      e.stopPropagation();
+      const r = resolveProxy(task);
+      if (!r) return;
+      openMenu(more, [
+        { header: 'In ' + cleanTitle(r.parent).trim() },
+        { label: '→  Go to it', onClick: () => {
+            setTab(r.section);
+            expandedIds.add(r.section + '::' + r.parent.title);
+            renderAll();
+            setTimeout(() => document.querySelector(`.task-card[data-key="${cssEscape(r.parent.title)}"]`)
+              ?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 60);
+          } },
+        { label: '✖  Not urgent', onClick: () => toggleSubUrgent(r.parent, r.section, r.sub) },
+        'sep',
+        { label: '🗑  Delete subtask', danger: true, onClick: () => {
+            const at = (r.parent.subtasks || []).indexOf(r.sub);
+            perform('🗑 Deleted',
+              [{ k: 'deleteSub', section: r.section, title: r.parent.title, text: r.sub.text }],
+              [{ k: 'addSub',    section: r.section, title: r.parent.title, text: r.sub.text, index: at },
+               { k: 'subUrgent', section: r.section, title: r.parent.title, text: r.sub.text, urgent: true }],
+              { now: true });
+          } },
+      ]);
+    });
+    return card;
+  }
+
   // Quick flags — urgent / today / tomorrow, one tap each
   card.querySelectorAll('.flag').forEach(btn => {
     btn.addEventListener('pointerdown', e => e.stopPropagation());
@@ -2572,15 +2826,23 @@ function buildSubtasks(container, task, section) {
     item.innerHTML = `
       ${SUB_DH}
       <div class="sub-cb ${st.checked ? 'checked' : ''}"></div>
-      <span class="sub-text ${st.checked ? 'done' : ''}">${esc(st.text)}</span>
+      <span class="sub-text ${st.checked ? 'done' : ''}${st.urgent ? ' urgent' : ''}">${esc(st.text)}</span>
+      <button class="flag sub-flag${st.urgent ? ' on urgent' : ''}" data-flag="urgent"
+              type="button" title="Urgent" aria-pressed="${!!st.urgent}">!</button>
       <button class="more-btn" type="button" title="Edit or delete">⋯</button>
     `;
+    item.querySelector('.sub-flag').addEventListener('pointerdown', e => e.stopPropagation());
+    item.querySelector('.sub-flag').addEventListener('click', e => {
+      e.stopPropagation();
+      toggleSubUrgent(task, section, st);
+    });
 
     // Inline rename of a subtask.
     const editSub = () => {
       closeMenu();
       const span = item.querySelector('.sub-text');
       if (!span || item.querySelector('.sub-edit')) return;
+      openEditor();
       const input = document.createElement('input');
       input.className = 'edit-in sub-edit';
       input.style.fontSize = '13px'; input.style.fontWeight = '400';
@@ -2590,6 +2852,7 @@ function buildSubtasks(container, task, section) {
       let closed = false;
       const finish = keep => {
         if (closed) return; closed = true;
+        closeEditor();
         const text = input.value.trim();
         if (keep && text && text !== st.text) {
           const from = st.text;
@@ -2655,15 +2918,19 @@ function buildSubtasks(container, task, section) {
   const btn   = add.querySelector('.sub-add-btn');
   const input = add.querySelector('.sub-add-input');
 
+  let fieldOpen = false;
   const open = e => {
     e.stopPropagation();
+    if (!fieldOpen) { fieldOpen = true; openEditor(); }
     add.classList.add('editing');
     input.focus();
   };
+  const shut = () => { add.classList.remove('editing'); if (fieldOpen) { fieldOpen = false; closeEditor(); } };
   const saveSubtask = keepOpen => {
     const text = input.value.trim();
-    if (!text) { add.classList.remove('editing'); return; }
+    if (!text) { shut(); return; }
     input.value = '';
+    shut();
     expandedIds.add(section + '::' + task.title);
     // Re-render straight away so the new subtask shows up without a refresh.
     perform('',
@@ -2682,9 +2949,9 @@ function buildSubtasks(container, task, section) {
   input.addEventListener('keydown', e => {
     e.stopPropagation();
     if (e.key === 'Enter')  { e.preventDefault(); saveSubtask(true); }
-    if (e.key === 'Escape') { e.preventDefault(); input.value = ''; add.classList.remove('editing'); btn.focus(); }
+    if (e.key === 'Escape') { e.preventDefault(); input.value = ''; shut(); btn.focus(); }
   });
-  input.addEventListener('blur', () => { if (input.value.trim()) saveSubtask(false); else add.classList.remove('editing'); });
+  input.addEventListener('blur', () => { if (input.value.trim()) saveSubtask(false); else shut(); });
 
   container.appendChild(add);
 }
@@ -2692,7 +2959,13 @@ function buildSubtasks(container, task, section) {
 // ── TOGGLE TASK ──────────────────────────────────────────────
 function toggleTask(task, section, cardEl) {
   haptic();
-  if (cardEl) { cardEl.classList.add('vanishing'); }
+  // Tick first, then leave. Seeing the checkbox fill before the row slides away
+  // is what makes this read as "done" rather than as a delay.
+  if (cardEl) {
+    const cb = cardEl.querySelector('.cb');
+    if (cb) cb.classList.toggle('checked', !task.checked);
+    cardEl.classList.add('vanishing');
+  }
   const wasDone = !!task.checked;
   const index   = (tasks[section] || []).indexOf(task);
   const back    = task._from || section;
@@ -2760,7 +3033,8 @@ function onAddParentChange() {
 }
 
 function openAdd(opts = {}) {
-  pendingAddDue = opts.due || (activeTab === 'Today' ? todayStr(0) : null);
+  const draft = addDraft; addDraft = null;
+  pendingAddDue = opts.due || draft?.due || (activeTab === 'Today' ? todayStr(0) : null);
   paintAddDue();
   document.getElementById('addHint').textContent = '';
   syncSectionSelect(opts.section);
@@ -2769,11 +3043,62 @@ function openAdd(opts = {}) {
     if ([...parSel.options].some(o => o.value === opts.parent)) parSel.value = opts.parent;
     onAddParentChange();
   }
+  if (draft && !opts.section && !opts.parent) {
+    document.getElementById('addTitle').value = draft.title;
+    if (draft.newSec) {
+      document.getElementById('addSection').value = NEW_SECTION;
+      onAddSectionChange();
+      document.getElementById('addNewSection').value = draft.newSec;
+    } else if (draft.section) {
+      document.getElementById('addSection').value = draft.section;
+      syncParentSelect();
+      if (draft.parent) { document.getElementById('addParent').value = draft.parent; onAddParentChange(); }
+    }
+    document.getElementById('addUrgent').checked = !!draft.urgent;
+    document.getElementById('addTitle').dispatchEvent(new Event('input'));
+  }
   document.getElementById('addSheet').classList.add('open');
-  setTimeout(() => document.getElementById('addTitle').focus(), 200);
+  setTimeout(() => {
+    const el = document.getElementById('addTitle');
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, 200);
 }
-function onBgClick(e) { if (e.target === document.getElementById('addSheet')) closeAdd(); }
-function closeAdd() {
+/* Clicking outside the sheet used to close it and wipe whatever had been typed.
+   Now a stray click on the backdrop is simply ignored while there is text in
+   the box - you have to mean it. And when the sheet does close with text still
+   in it, that text is kept and put back next time it opens, so nothing typed is
+   ever lost. */
+function addSheetHasText() {
+  return !!document.getElementById('addTitle').value.trim()
+      || !!document.getElementById('addNewSection').value.trim();
+}
+function onBgClick(e) {
+  if (e.target !== document.getElementById('addSheet')) return;
+  if (addSheetHasText()) { nudgeSheet(); return; }
+  closeAdd();
+}
+function nudgeSheet() {
+  const el = document.querySelector('#addSheet .sheet');
+  if (!el) return;
+  el.classList.remove('nudge');
+  void el.offsetWidth;                 // restart the animation
+  el.classList.add('nudge');
+  document.getElementById('addTitle').focus();
+}
+let addDraft = null;      // what was typed but not submitted
+
+function closeAdd({ keepDraft = true } = {}) {
+  const title = document.getElementById('addTitle').value.trim();
+  const newSec = document.getElementById('addNewSection').value.trim();
+  addDraft = (keepDraft && (title || newSec))
+    ? { title: document.getElementById('addTitle').value, newSec,
+        section: document.getElementById('addSection').value,
+        parent: document.getElementById('addParent').value,
+        urgent: document.getElementById('addUrgent').checked,
+        due: pendingAddDue }
+    : null;
+
   document.getElementById('addSheet').classList.remove('open');
   document.getElementById('addTitle').value = '';
   document.getElementById('addHint').textContent = '';
@@ -2816,7 +3141,7 @@ function submitAdd() {
     if (!p) { toast('That task has moved — try again'); syncSectionSelect(section); return; }
     if ((p.subtasks || []).some(s => s.text === title)) { closeAdd(); toast('Already there'); return; }
     expandedIds.add(section + '::' + p.title);
-    closeAdd();
+    closeAdd({ keepDraft: false });
     if (!['All','🚨 Urgent','Today','Upcoming','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
     perform(`＋ under ${cleanTitle(p)}`,
       [{ k: 'addSub',    section, title: p.title, text: title }],
@@ -2827,7 +3152,7 @@ function submitAdd() {
 
   const full = urgent ? `🚨 URGENT: ${cleanText}` : cleanText;
   const due  = parsed.due || pendingAddDue || null;
-  closeAdd();
+  closeAdd({ keepDraft: false });
   if (!['All','🚨 Urgent','Today','Upcoming','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
   perform(due ? `Added to ${section} · ${dueLabel(due)}` : `Added to ${section}`,
     [{ k: 'addTask',    section, title: full, note: '', due }],
