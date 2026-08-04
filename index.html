@@ -1274,6 +1274,17 @@ function parseMd(md) {
       if (curTask) tsks[curSec].push(curTask);
       const checked = /\[[xX]\]/.test(line);
       let text = line.replace(/^- \[[ xX]\]\s*/, '');
+      /* A completed row remembers the section it came from as a trailing
+         "^Section". Without it, unticking something completed in an earlier
+         session had nowhere to send the task back to, so it stayed inside
+         Completed — unticked, and therefore invisible in every other view.
+         Only read on rows under Completed, so a caret anywhere else stays
+         ordinary text, and rows written before this existed simply have none. */
+      let from = null;
+      if (curSec === 'Completed') {
+        const f = text.match(/\s*\^([^^]+?)\s*$/);
+        if (f) { from = f[1]; text = text.slice(0, f.index); }
+      }
       // A trailing "@YYYY-MM-DD" is the due date. Lines without one are
       // perfectly valid — everything written before dates existed still reads.
       let due = null;
@@ -1282,7 +1293,7 @@ function parseMd(md) {
       let title = text, note = '';
       const b = text.match(/^\*\*(.+?)\*\*(.*)$/);
       if (b) { title = b[1]; note = b[2].replace(/^\s*-\s*/, '').trim(); }
-      curTask = { title, note, due, checked, subtasks: [], _from: null };
+      curTask = { title, note, due, checked, subtasks: [], _from: from };
       continue;
     }
     if (curTask && /^\s+- \[[ xX]\]/.test(line)) {
@@ -1309,7 +1320,10 @@ function toMarkdown(model) {
     (m.tasks[sec] || []).forEach(t => {
       const note = t.note ? ` - ${t.note}` : '';
       const due  = t.due ? ` @${t.due}` : '';
-      md += `- ${t.checked ? '[x]' : '[ ]'} **${t.title}**${note}${due}\n`;
+      // Where a completed task came from, so unticking it can send it home
+      // even in a later session. See the matching read in parseMd.
+      const from = (sec === 'Completed' && t._from) ? ` ^${t._from}` : '';
+      md += `- ${t.checked ? '[x]' : '[ ]'} **${t.title}**${note}${due}${from}\n`;
       (t.subtasks || []).forEach(st => {
         const mark = st.urgent ? '🚨 URGENT: ' : '';
         md += `  - ${st.checked ? '[x]' : '[ ]'} ${mark}${st.text}\n`;
@@ -2125,8 +2139,19 @@ function parseWhen(raw) {
 
 function haptic(ms = 8) { try { navigator.vibrate?.(ms); } catch (_) {} }
 
-function isUrgent(t) { return /urgent|🚨/i.test(t.title); }
-function cleanTitle(t) { return t.title.replace(/🚨\s*URGENT:\s*/i, '').replace(/URGENT:\s*/i, ''); }
+/* Urgency is a prefix the app writes itself ("🚨 URGENT: "), not a word to go
+   looking for. Matching "urgent" anywhere in the title meant a task called
+   "Reply to Urgent Care about the invoice" was permanently urgent — and since
+   cleanTitle then found no prefix to strip, toggleUrgent computed a title
+   identical to the one it had, bailed out, and the ! button did nothing at
+   all, for good. Leaving cleanTitle unanchored was its own bug: it deleted the
+   word out of the middle of "Ask HR re the URGENT: memo".
+
+   Anchored, this is the same rule parseMd already applies to subtasks. A bare
+   🚨 prefix still counts, so anything hand-typed into the file keeps working. */
+const URGENT_MARK = /^\s*(?:🚨\s*URGENT:|🚨|URGENT:)\s*/iu;
+function isUrgent(t) { return URGENT_MARK.test(t.title); }
+function cleanTitle(t) { return t.title.replace(URGENT_MARK, ''); }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // ── SUBTASK → COMPLETED ──────────────────────────────────────
@@ -3022,10 +3047,16 @@ function toggleTask(task, section, cardEl) {
   }
   const wasDone = !!task.checked;
   const index   = (tasks[section] || []).indexOf(task);
-  const back    = task._from || section;
+  /* Never send a task "back" into Completed — that is where it already is, and
+     an unticked row sitting in Completed shows up in no other view at all.
+     Anything completed before the ^Section marker existed has no origin
+     recorded, so fall back to the first real section rather than stranding it. */
+  const home    = task._from || (section !== 'Completed' ? section : null)
+                  || sections.find(s => s !== 'Completed') || section;
+  const back    = home;
   setTimeout(() => {
     if (wasDone) {
-      perform('↩ Moved back',
+      perform(`↩ Moved to ${back}`,
         [{ k: 'uncompleteTask', title: task.title, toSection: back, index: 0 }],
         [{ k: 'completeTask',   section: back, title: task.title }]);
     } else {
@@ -3516,7 +3547,10 @@ function attachSwipe(card, task, section) {
 
   card.addEventListener('pointerdown', e => {
     if (e.pointerType === 'mouse') return;             // touch/pen only
-    if (e.target.closest('.dh, .sub-dh, .nav-dh, .more-btn, .cb, .sub-cb, input, button')) return;
+    /* Subtask rows are inside the card, so without excluding them a swipe that
+       started on a subtask bubbled up and completed the whole parent task,
+       taking every subtask with it. */
+    if (e.target.closest('.dh, .sub-dh, .nav-dh, .more-btn, .cb, .sub-cb, input, button, .sub-item, .sub-add, .subs-list')) return;
     if (dnd.active) return;
     id = e.pointerId; x0 = e.clientX; y0 = e.clientY; armed = true; active = false;
   });
@@ -3748,6 +3782,8 @@ function makeDraggable(el, type, data, handleSelector) {
   handleEl.addEventListener('pointerdown', e => {
     if (dnd.armed || dnd.active) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
+    // Don't offer a drag the view cannot honour — see DERIVED_ORDER.
+    if (type === 'task' && DERIVED_ORDER.includes(activeTab)) return;
     e.preventDefault(); e.stopPropagation();
 
     dnd.armed = true;
@@ -3766,12 +3802,35 @@ function makeDraggable(el, type, data, handleSelector) {
   });
 }
 
+/* Views whose order is worked out at render time rather than stored: Today and
+   Upcoming sort by due date, 🚨 Urgent collects tasks from every project. A
+   manual reorder in any of them has nothing to write down, and the card you
+   drop next to usually belongs to a different project. */
+const DERIVED_ORDER = ['Today', 'Upcoming', '🚨 Urgent'];
+
 /* Drops resolve by name, not by array index or DOM node — both go stale the
    moment anything re-renders. */
 function performDrop({ type, src, over, overBefore }) {
   let op = null, inverse = null, label = '';
 
   if (type === 'task') {
+    /* Belt and braces with the guard in makeDraggable: a drop here must never
+       change a task's project just because of who it landed next to.
+
+       Today and Upcoming are sorted by due date and 🚨 Urgent gathers tasks
+       from every project, so in all three the neighbouring card routinely
+       belongs to a different section — and `over.sec` is taken from whatever
+       was underneath. Dropping next to it quietly moved the task into that
+       project, and because the view immediately re-sorted, nothing looked like
+       it had happened. The order in these views is derived rather than stored,
+       so there is nothing a reorder could even save. */
+    if (DERIVED_ORDER.includes(activeTab)) {
+      renderAll();
+      toast(activeTab === '🚨 Urgent'
+        ? 'Urgent gathers tasks from every project — reorder inside a project'
+        : `${activeTab} is ordered by date — reorder inside a project`);
+      return;
+    }
     const from = src.section, to = over.sec;
     const srcArr = tasks[from], tgtArr = tasks[to];
     if (!srcArr || !tgtArr) { renderAll(); return; }
