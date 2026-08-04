@@ -1704,6 +1704,14 @@ function adoptModel(model, { render = true } = {}) {
      does nothing" glitch. */
   if (render && toMarkdown(model) === toMarkdown()) return false;
   sections = model.sections; tasks = model.tasks;
+  /* Every card on screen is still pointing at a task object we have just thrown
+     away. renderTasks() is allowed to stop early when the visible list *looks*
+     unchanged — but "looks unchanged" is computed from titles and dates, not
+     from object identity, so a change in a section you aren't looking at slips
+     straight through it and leaves the visible cards bound to dead objects.
+     That is the same "clicking does nothing" glitch by another route, so the
+     short-circuit has to be disarmed whenever the model is swapped. */
+  invalidateRender();
   if (!render) return false;
   renderSidebar(); renderMobileTabs(); renderTasks(); syncSectionSelect();
   return true;
@@ -1793,6 +1801,15 @@ async function loadTasks(opts = {}) {
       else document.getElementById('taskScroll').innerHTML = emptyState();
     }
     if (String(e.message).includes('no-token')) setAuthWarn(true);
+  } finally {
+    /* A manual sync replaces the list with a spinner before it starts, and
+       several paths out of here never repaint: adoptModel deliberately does
+       nothing when the file matches what we already have, and every failure
+       (dead token, Drive unreachable, a null response) returns early. Any of
+       those left the spinner up permanently — the tasks were fine, but it
+       looked exactly like the app had lost them. Nothing may exit this
+       function with the spinner still on screen. */
+    if (!opts.quiet && !document.querySelector('#taskScroll .task-card')) renderAll();
   }
 }
 
@@ -2377,7 +2394,17 @@ function startEditTask(task, section, card) {
   openEditor();
   let closed = false;
   const flushHeld = () => closeEditor();
-  const cancel = () => { if (closed) return; closed = true; closeEditor(); body.innerHTML = prevHTML; renderTasks(); };
+  /* Putting prevHTML back restores the markup but not the listeners that
+     makeCard bound to the flag buttons and the title, so this element must not
+     be reused — invalidateCard forces a real rebuild on the render below. */
+  const cancel = () => {
+    if (closed) return;
+    closed = true;
+    closeEditor();
+    body.innerHTML = prevHTML;
+    invalidateCard(card);
+    renderTasks();
+  };
   const save = () => {
     if (closed) return;
     const newTitle = titleIn.value.trim();
@@ -2387,7 +2414,14 @@ function startEditTask(task, section, card) {
     closed = true;
     closeEditor();
     const oldTitle = task.title, oldNote = task.note || '', oldDue = task.due || null;
-    if (newTitle === oldTitle && newNote === oldNote && newDue === oldDue) { renderTasks(); return; }
+    /* Nothing changed, so no op is committed and the task's signature is
+       identical — the render would stop early and the edit form would stay on
+       screen forever, with dead Save and Cancel buttons. Rebuild the card. */
+    if (newTitle === oldTitle && newNote === oldNote && newDue === oldDue) {
+      invalidateCard(card);
+      renderTasks();
+      return;
+    }
     renameExpandedKey(section, oldTitle, newTitle);
     perform('✎ Saved',
       [{ k: 'editTask', section, from: oldTitle, title: newTitle, note: newNote, due: newDue }],
@@ -2489,6 +2523,23 @@ function cardSignature(task, section, expanded) {
    old cards' handlers still close over the old objects. */
 let cardPool = new Map();
 let lastLayoutSig = null;
+
+/* Disarm the "nothing has changed, touch nothing" short-circuit in renderTasks
+   for exactly one render. Anything that swaps the task objects, or edits a
+   card's DOM by hand, has to call this — otherwise the next render recognises
+   the layout as unchanged, returns early, and leaves the broken or stale card
+   sitting on screen indefinitely. */
+function invalidateRender() { lastLayoutSig = null; }
+
+/* Mark one card as no longer safe to reuse, so cardFor rebuilds it from
+   scratch. Needed after anything rewrites the card's innerHTML: the markup
+   comes back, but the listeners bound in makeCard do not. */
+function invalidateCard(el) {
+  if (!el) return;
+  el.__task = null;
+  el.dataset.sig = '';
+  invalidateRender();
+}
 
 function cardFor(task, section) {
   const key = section + '::' + task.title;
@@ -2931,6 +2982,9 @@ function buildSubtasks(container, task, section) {
     if (!text) { shut(); return; }
     input.value = '';
     shut();
+    /* Same reason as the add sheet: a duplicate subtask cannot be stored, and
+       silently accepting one left an Undo that deleted the original. */
+    if ((task.subtasks || []).some(s => s.text === text)) { toast('Already there'); return; }
     expandedIds.add(section + '::' + task.title);
     // Re-render straight away so the new subtask shows up without a refresh.
     perform('',
@@ -3152,6 +3206,17 @@ function submitAdd() {
 
   const full = urgent ? `🚨 URGENT: ${cleanText}` : cleanText;
   const due  = parsed.due || pendingAddDue || null;
+  /* A task is identified by its name, so a second one with the same name in the
+     same section cannot be stored — applyOp reads it as a replay of the first
+     and drops it. Saying "Added" for something that was never added is bad
+     enough; the Undo button on that toast then deleted the original, note,
+     date and subtasks included. Refuse clearly instead. */
+  if ((tasks[section] || []).some(t => t.title === full)) {
+    closeAdd({ keepDraft: false });
+    if (!['All','🚨 Urgent','Today','Upcoming','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
+    toast(`Already in ${section}`);
+    return;
+  }
   closeAdd({ keepDraft: false });
   if (!['All','🚨 Urgent','Today','Upcoming','Completed'].includes(activeTab) && activeTab !== section) setTab(section);
   perform(due ? `Added to ${section} · ${dueLabel(due)}` : `Added to ${section}`,
