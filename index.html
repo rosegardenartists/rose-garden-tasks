@@ -1243,8 +1243,28 @@ function signOut() {
 }
 
 // ── DRIVE ───────────────────────────────────────────────────
+/* Every request to Drive gets a deadline.
+
+   Without one, a request that simply never answers — a phone that loses signal
+   mid-write, a proxy that swallows the connection — leaves flush() awaiting
+   forever with `flushing` still set. That flag is what stops two saves running
+   at once, so once it is stuck nothing can ever save again: the dot sits on
+   "Saving…", every later change piles up unsent, and only a reload clears it.
+   Seen happening for real, not a theoretical worry. An aborted request throws,
+   which lands in flush's catch and schedules a proper retry. */
+const DRIVE_TIMEOUT_MS = 15000;
+function timeoutSignal(ms) {
+  if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
+  const c = new AbortController();          // older Safari
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+function driveFetch(url, opts = {}) {
+  return fetch(url, { ...opts, signal: timeoutSignal(DRIVE_TIMEOUT_MS) });
+}
+
 async function driveGet() {
-  const r = await authed(() => fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?alt=media`, {
+  const r = await authed(() => driveFetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?alt=media`, {
     headers: { Authorization: `Bearer ${accessToken}` }
   }));
   if (!r.ok) throw new Error('drive get ' + r.status);
@@ -1255,7 +1275,7 @@ async function driveGet() {
 // Tiny probe — a few hundred bytes — so we can poll often without pulling the
 // whole file every time.
 async function driveVersion() {
-  const r = await authed(() => fetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?fields=version,modifiedTime`, {
+  const r = await authed(() => driveFetch(`https://www.googleapis.com/drive/v3/files/${FILE_ID}?fields=version,modifiedTime`, {
     headers: { Authorization: `Bearer ${accessToken}` }
   }));
   if (!r.ok) throw new Error('drive meta ' + r.status);
@@ -1263,7 +1283,7 @@ async function driveVersion() {
   return String(j.version || j.modifiedTime || '');
 }
 async function drivePut(content) {
-  const r = await authed(() => fetch(`https://www.googleapis.com/upload/drive/v3/files/${FILE_ID}?uploadType=media&fields=version`, {
+  const r = await authed(() => driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${FILE_ID}?uploadType=media&fields=version`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'text/plain; charset=utf-8' },
     body: content
@@ -1788,12 +1808,37 @@ function scheduleFlushRetry(ms = 5000) {
   saveTimer = setTimeout(flush, ms);
 }
 
+/* Belt and braces behind the request timeouts.
+
+   `flushing` is what stops two saves running at once, so if it is ever left
+   set — a promise that never settles, a suspended tab resuming oddly — the app
+   goes quietly mute: changes queue up, the dot reads "Saving…", and only a
+   reload fixes it. The watchdog notices and lets saving start again.
+
+   Unsticking is not free: the abandoned save might still be mid-flight and
+   would then be a second writer, the exact thing the flag prevents. So each
+   run takes a generation number, and any run that finds itself superseded
+   bails out before touching baseMd, baseVersion or the queue. */
+let flushStartedAt = 0;
+let flushGen = 0;
+const FLUSH_STUCK_MS = 60000;   // 4x the request timeout: only true wedges
+
+function unstickFlush() {
+  if (!flushing || Date.now() - flushStartedAt < FLUSH_STUCK_MS) return;
+  flushGen++;               // supersede whatever is still out there
+  flushing = false;
+  if (queue.length) { setSync('offline'); scheduleFlushRetry(500); }
+}
+
 async function flush() {
   if (flushing || !queue.length || !accessToken) return;
   // Never re-render mid-drag — it would swap the DOM out from under the
   // pointer and the drop would land in the wrong place.
   if (dnd.active) { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 300); return; }
   flushing = true;
+  flushStartedAt = Date.now();
+  const myGen = ++flushGen;
+  const superseded = () => myGen !== flushGen;
   clearTimeout(saveTimer);
   setSync('saving');
   try {
@@ -1822,6 +1867,11 @@ async function flush() {
       if (check !== baseVersion) { baseVersion = check; baseMd = null; continue; }
 
       const newVersion = await drivePut(out);
+      /* The watchdog gave up on us while that write was in flight and another
+         save has taken over. Stop here rather than trimming the queue or
+         rewriting baseMd underneath it — the newer run is now the one source
+         of truth, and it will re-send anything still outstanding. */
+      if (superseded()) return;
       baseMd = out;
       baseVersion = newVersion || (await driveVersion());
       queue = queue.slice(taken.length);
@@ -1858,7 +1908,8 @@ async function flush() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(flush, 5000);   // retry with a short backoff
   } finally {
-    flushing = false;
+    // If we were superseded, the newer run owns the flag — leave it alone.
+    if (!superseded()) flushing = false;
   }
 }
 
@@ -1931,7 +1982,7 @@ const INBOX_QUERY = "name contains 'rg-inbox' and trashed = false";
 async function inboxList() {
   const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(INBOX_QUERY)}`
             + `&fields=files(id,name,mimeType)&pageSize=20`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const r = await driveFetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   if (!r.ok) return [];
   return (await r.json()).files || [];
 }
@@ -1940,7 +1991,7 @@ async function inboxRead(f) {
   const url = f.mimeType === 'application/vnd.google-apps.document'
     ? `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=text/plain`
     : `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const r = await driveFetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   /* Throw rather than return empty. An unreadable file used to come back as ''
      which parsed to nothing, and drainInbox then binned it as "done" — so a
      permissions hiccup, an expired token or an unexpected file type silently
@@ -1949,7 +2000,7 @@ async function inboxRead(f) {
   return r.text();
 }
 async function inboxBin(f) {
-  await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, {
+  await driveFetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ trashed: true })
@@ -2102,9 +2153,10 @@ function verifySoon(delay = 2200) {
   }, delay);
 }
 async function pollForChanges(force = false) {
-  // Before any of the early returns below — the date rolls over whether or not
-  // there is a token, a network, or anything new on Drive.
+  // Before any of the early returns below — the date rolls over, and a save
+  // can be wedged, whether or not there is a token or anything new on Drive.
   checkDayRollover();
+  unstickFlush();
   if (polling || !accessToken) return;
   if (!force) {
     if (document.hidden) return;
