@@ -1217,11 +1217,26 @@ async function reconnect() {
 function signIn() { reconnect(); }
 
 function signOut() {
-  if (accessToken) google.accounts.oauth2.revoke(accessToken, () => {});
+  /* Revoking is a courtesy, not the point of this function, and it used to be
+     the first statement — so when Google's script hadn't loaded (offline, or a
+     cold start before it arrives) this threw before clearing anything and the
+     button did nothing at all, with no error shown. */
+  try { if (accessToken) google?.accounts?.oauth2?.revoke(accessToken, () => {}); } catch (_) {}
   store.del('rg_access_token');
   store.del('rg_token_exp');
   store.del('rg_cache_md');
+  /* Forget which account this was. Keeping it meant every later silent renewal
+     and every popup still named the old address, so signing back in as the
+     other Google account failed over and over — the exact "it keeps asking me
+     to sign in" problem. The pending queue goes too: those edits belong to the
+     account that just left, and replaying them into the next one corrupts it. */
+  store.del('rg_email');
+  store.del('rg_auth_try');
+  store.del('rg_pending_ops');
+  queue = []; baseMd = null; baseVersion = null; recentOps = [];
+  undoStack.length = 0; redoStack.length = 0;
   clearTimeout(renewTimer);
+  clearTimeout(saveTimer);
   accessToken = null; tokenExp = 0; sections = []; tasks = {};
   document.getElementById('settingsOv').classList.remove('open');
   showPage('loginPage');
@@ -1554,6 +1569,11 @@ function reconcileRecent(op) {
       });
       break;
     case 'moveTask':
+      // A later move wins outright. Without this, undoing a move left the
+      // original in the history, the healer saw the task back in its old
+      // section, called the move lost, and moved it away again.
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(o.k === 'moveTask' && o.title === op.title));
       recentOps.forEach(({ op: o }) => {
         if (o !== op && o.section && refersTo(o, op.title)) o.section = op.to;
       });
@@ -1583,6 +1603,35 @@ function reconcileRecent(op) {
         o === op || !(['addSub', 'editSub'].includes(o.k) && o.title === op.title && o.text === gone));
       break;
     }
+
+    /* ── the undo side ──────────────────────────────────────────────────
+       Everything above supersedes an older op with a newer one. These do the
+       same for the ops undo uses, and leaving them out was a real bug: the
+       healer had no idea an action had been taken back, so the moment any
+       other device wrote to the file it decided the original change had gone
+       missing and applied it all over again. Delete a task, press ⌘Z, and a
+       few seconds later it would vanish again on every device. */
+    case 'restoreTask':
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(o.k === 'deleteTask' && o.title === op.task.title));
+      break;
+    case 'addSub':
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(['deleteSub', 'promoteSub'].includes(o.k) && o.title === op.title &&
+                      (o.text === op.text || o.subText === op.text)));
+      break;
+    case 'demoteSub':
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(o.k === 'promoteSub' && o.title === op.title && o.subText === op.subText));
+      break;
+    case 'subUrgent':
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(o.k === 'subUrgent' && o.title === op.title && o.text === op.text));
+      break;
+    case 'addTask':
+      recentOps = recentOps.filter(({ op: o }) =>
+        o === op || !(o.k === 'deleteTask' && o.title === op.title));
+      break;
   }
 }
 
@@ -1731,6 +1780,14 @@ function adoptModel(model, { render = true } = {}) {
   return true;
 }
 
+// Come back and try the save again. Every path out of flush() that leaves work
+// in the queue has to call this, or the change waits for the user to do
+// something else before it gets another chance.
+function scheduleFlushRetry(ms = 5000) {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, ms);
+}
+
 async function flush() {
   if (flushing || !queue.length || !accessToken) return;
   // Never re-render mid-drag — it would swap the DOM out from under the
@@ -1742,10 +1799,10 @@ async function flush() {
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       const v = await driveVersion();
-      if (v == null) return;
+      if (v == null) { setSync('offline'); scheduleFlushRetry(); return; }
       if (v !== baseVersion || baseMd == null) {
         const md = await driveGet();
-        if (md == null) return;
+        if (md == null) { setSync('offline'); scheduleFlushRetry(); return; }
         baseMd = md; baseVersion = v;
       }
       const model = parseMd(baseMd);
@@ -1754,9 +1811,15 @@ async function flush() {
       taken.forEach(op => applyOp(model, op));
       const out = toMarkdown(model);
 
-      // Nobody else wrote in the meantime? Then this write is safe.
+      /* Nobody else wrote in the meantime? Then this write is safe.
+
+         When someone did, clear baseMd as well as advancing the version.
+         Advancing the version alone made the next loop think it was already
+         holding the newest file, skip the re-download at the top, replay onto
+         the pre-collision text and write that — so the guard that exists to
+         prevent a collision caused one, erasing the other device's change. */
       const check = await driveVersion();
-      if (check !== baseVersion) { baseVersion = check; continue; }
+      if (check !== baseVersion) { baseVersion = check; baseMd = null; continue; }
 
       const newVersion = await drivePut(out);
       baseMd = out;
@@ -1766,7 +1829,14 @@ async function flush() {
       taken.forEach(rememberOp);
       adoptModel(model);
       setSync(queue.length ? 'saving' : 'idle');
-      if (queue.length) { flushing = false; return flush(); }
+      /* More work arrived while we were writing. Go round again *inside* this
+         call rather than recursing: `return flush()` used to hand control back
+         here the moment the inner call hit its first await, the finally below
+         then cleared `flushing`, and a third change could start a second save
+         alongside the one still in flight. Two saves sharing baseMd and queue
+         can each write a file missing the other's change and then trim it off
+         the queue, so it ends up in neither. */
+      if (queue.length) { attempt = -1; continue; }
       // If our write landed on top of someone else's, the version will have
       // jumped by more than one. Check the file again straight away so the
       // healing pass can put back anything we trampled.
@@ -1777,7 +1847,12 @@ async function flush() {
       verifySoon();
       return;
     }
+    /* Three collisions in a row. The queue is still full, so this has to come
+       back on its own — it used to just stop, leaving unsaved changes sitting
+       there behind an "Offline" dot until the user happened to do something
+       else, which on a backgrounded tab could be hours. */
     setSync('offline');
+    scheduleFlushRetry();
   } catch (_) {
     setSync('offline');
     clearTimeout(saveTimer);
@@ -1834,11 +1909,23 @@ async function loadTasks(opts = {}) {
    the tasks into the list, and bins the file. Net effect: "Claude, add X to
    Personal" shows up here on its own, from any device.
 
-   Inbox file format — one task per line, blank lines and #comments ignored:
-       Personal :: Grout the kitchen
-       Label :: !Call Preston back        ← leading ! marks it urgent
-       Buy milk                           ← no section given, goes to Personal
-*/
+   Inbox file format — one task per line. The parser is deliberately generous,
+   because the thing writing these files is a language model on whatever device
+   happened to be to hand, and a note that half-works is worse than useless:
+
+       Personal :: Grout the kitchen      ← "Section :: Task"
+       Label | Call Preston back          ← a pipe works too
+       - [ ] Take out the bins            ← bullets and checkboxes are stripped
+       * **Book the mastering slot**      ← as is bold
+       !Call the plumber                  ← leading ! marks it urgent
+       🚨 URGENT: Chase the invoice       ← so does the marker itself
+       Buy milk                           ← no section → Personal
+       Call Preston friday                ← trailing dates are understood
+         - send him the stems             ← indented lines become subtasks
+
+   Blank lines and #comments are ignored. A section name only counts if it
+   already exists (case-insensitive); anything else is treated as part of the
+   task, so "Call Dan | re pricing" stays whole rather than losing its front. */
 const INBOX_QUERY = "name contains 'rg-inbox' and trashed = false";
 
 async function inboxList() {
@@ -1854,7 +1941,12 @@ async function inboxRead(f) {
     ? `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=text/plain`
     : `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-  return r.ok ? r.text() : '';
+  /* Throw rather than return empty. An unreadable file used to come back as ''
+     which parsed to nothing, and drainInbox then binned it as "done" — so a
+     permissions hiccup, an expired token or an unexpected file type silently
+     destroyed the note. Now the file is left alone and retried next poll. */
+  if (!r.ok) throw new Error('inbox-read-' + r.status);
+  return r.text();
 }
 async function inboxBin(f) {
   await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, {
@@ -1865,21 +1957,70 @@ async function inboxBin(f) {
 }
 
 function parseInbox(text) {
+  // Where a line with no section named goes. Personal by name if it exists,
+  // otherwise the first real section — never Completed, and never just
+  // "whatever happens to be first in the file", which used to land personal
+  // errands in whichever project sat at the top.
+  const fallback = () =>
+    sections.find(s => s.toLowerCase() === 'personal') ||
+    sections.find(s => s !== 'Completed') ||
+    'Personal';
+
+  // Strip bullets, checkboxes and numbering, in that order and repeatedly:
+  // Claude writes "- [ ] x" as often as "* x" or "1. x".
+  const strip = s => {
+    let prev;
+    do {
+      prev = s;
+      s = s.replace(/^\s*(?:[-*+•]|\d+[.)])\s+/, '')
+           .replace(/^\s*\[[ xX]\]\s*/, '')
+           .trim();
+    } while (s !== prev);
+    return s;
+  };
+  const unbold = s => s.replace(/^\*\*(.*?)\*\*$/, '$1').trim();
+
   const out = [];
   text.split('\n').forEach(raw => {
-    let line = raw.replace(/^\s*[-*]\s+/, '').trim();
-    if (!line || line.startsWith('#')) return;
-    let section = null, title = line;
+    if (!raw.trim() || /^\s*#/.test(raw.trim())) return;
+
+    // An indented line under a task is one of its subtasks.
+    const indented = /^\s{2,}|^\t/.test(raw) && out.length > 0;
+    let line = unbold(strip(raw));
+    if (!line) return;
+
+    if (indented) {
+      out[out.length - 1].subtasks.push(line);
+      return;
+    }
+
+    /* Only split on "::" or "|" when the left side really is one of their
+       sections. Splitting unconditionally is what turned "Call Dan | re
+       pricing" into a task called "re pricing". */
+    let section = null;
     const m = line.match(/^(.+?)\s*(?:::|\|)\s*(.+)$/);
-    if (m) { section = m[1].trim(); title = m[2].trim(); }
+    if (m) {
+      const known = sections.find(s => s.toLowerCase() === m[1].trim().toLowerCase());
+      if (known) { section = known; line = unbold(strip(m[2])); }
+    }
+
+    /* Urgency is checked after the bold and bullets come off, so
+       "**!Urgent thing**" is caught — before, the ! was still wrapped in
+       asterisks, the test failed, and the ! ended up in the task's name. */
     let urgent = false;
-    if (/^!/.test(title)) { urgent = true; title = title.replace(/^!\s*/, ''); }
-    title = title.replace(/^\*\*|\*\*$/g, '').trim();
+    const URG = /^\s*(?:🚨\s*)?(?:URGENT:|!)\s*/iu;
+    if (URG.test(line)) { urgent = true; line = line.replace(URG, '').trim(); }
+
+    // "call Preston friday" → title "call Preston", due Friday.
+    const parsed = parseWhen(line);
+    const title  = (parsed.text || line).trim();
     if (!title) return;
-    const known = sections.find(s => s.toLowerCase() === String(section || '').toLowerCase());
+
     out.push({
-      section: known || sections.find(s => s !== 'Completed') || 'Personal',
-      title: urgent ? `🚨 URGENT: ${title}` : title
+      section: section || fallback(),
+      title: urgent ? `🚨 URGENT: ${title}` : title,
+      due: parsed.due || null,
+      subtasks: []
     });
   });
   return out;
@@ -1893,17 +2034,31 @@ async function drainInbox() {
 
   let added = 0, names = [];
   for (const f of files) {
-    let text = '';
+    let text;
+    // Could not read it? Leave it in Drive and try again next poll. Binning a
+    // note we never managed to read is how tasks disappeared for good.
     try { text = await inboxRead(f); } catch (_) { continue; }
+
     for (const item of parseInbox(text)) {
-      const exists = (tasks[item.section] || []).some(t => t.title === item.title);
-      if (!exists) {
-        if (!tasks[item.section]) tasks[item.section] = [];
-        tasks[item.section].unshift({ title: item.title, note: '', checked: false, subtasks: [], _from: null });
-        queue.push({ k: 'addTask', section: item.section, title: item.title, note: '' });
-        added++; names.push(item.title);
-      }
+      /* Look for it everywhere, not just in the target section. Checking only
+         the target meant a task you had already ticked off — which moves it to
+         Completed — looked missing, so every poll added it back and it came
+         alive again 30 seconds after you finished it. */
+      const seen = sections.some(s => (tasks[s] || []).some(t => t.title === item.title));
+      if (seen) continue;
+      if (!tasks[item.section]) tasks[item.section] = [];
+      const subtasks = item.subtasks.map(t => ({ text: t, checked: false }));
+      tasks[item.section].unshift({ title: item.title, note: '', due: item.due || null,
+                                    checked: false, subtasks, _from: null });
+      queue.push({ k: 'addTask', section: item.section, title: item.title, note: '', due: item.due || null });
+      item.subtasks.forEach(t =>
+        queue.push({ k: 'addSub', section: item.section, title: item.title, text: t }));
+      added++; names.push(item.title);
     }
+
+    /* Only bin a note once it has actually been read and folded in. If the
+       trash call itself fails the note stays put, but the dedup check above
+       means the next poll won't add anything twice. */
     try { await inboxBin(f); } catch (_) {}
   }
   if (added) {
@@ -1923,6 +2078,18 @@ const POLL_MS = 30000;
 let pollTick = 0;
 let polling = false;
 
+/* Nothing else notices the day rolling over: the poll only repaints when the
+   file changed, so an app left open overnight keeps showing yesterday's dates.
+   Checked on every tick, which costs one string compare. */
+let lastSeenDay = todayStr();
+function checkDayRollover() {
+  const today = todayStr();
+  if (today === lastSeenDay) return;
+  lastSeenDay = today;
+  invalidateRender();
+  renderAll();
+}
+
 /* Called just after a save lands. Re-reads the file a couple of seconds later
    to confirm our change is still there — the only window in which another
    device's write can collide with ours. Cheap, and independent of POLL_MS. */
@@ -1935,6 +2102,9 @@ function verifySoon(delay = 2200) {
   }, delay);
 }
 async function pollForChanges(force = false) {
+  // Before any of the early returns below — the date rolls over whether or not
+  // there is a token, a network, or anything new on Drive.
+  checkDayRollover();
   if (polling || !accessToken) return;
   if (!force) {
     if (document.hidden) return;
@@ -2529,8 +2699,14 @@ function cardSignature(task, section, expanded) {
   // Only what actually changes the card. Using activeTab here was wrong: it made
   // every card rebuild on any tab switch, when the view only alters one badge.
   const showsSectionBadge = ['Today', 'Upcoming'].includes(activeTab) ? 1 : 0;
+  /* How many days away the date is, not just the date itself. A card due
+     tomorrow reads "Tomorrow"; at midnight that becomes "Today" and the ☀
+     button should switch on — but nothing in the signature moved, so an app
+     left open overnight kept yesterday's wording, and on the Today tab a card
+     could sit under an "Overdue" heading still wearing a green "Today" badge. */
+  const daysAway = task.due ? dayDiff(task.due) : '';
   return [section, task.title, task.note || '', task.due || '', task.checked ? 1 : 0,
-          expanded ? 1 : 0, showsSectionBadge,
+          expanded ? 1 : 0, showsSectionBadge, daysAway,
           (task.subtasks || []).map(s => (s.urgent ? '!' : '') + s.text).join('\u0001')].join('\u0002');
 }
 
@@ -2948,9 +3124,16 @@ function buildSubtasks(container, task, section) {
     };
     const removeSub = () => {
       const at = (task.subtasks || []).indexOf(st);
+      /* addSub rebuilds a subtask as a plain one, so the urgent flag has to be
+         put back explicitly — otherwise undoing the deletion of an urgent
+         subtask returned it unflagged and it disappeared from the Urgent list.
+         The rows in the Urgent view already did this; the ones on the card
+         itself did not. */
+      const inverse = [{ k: 'addSub', section, title: task.title, text: st.text, index: at }];
+      if (st.urgent) inverse.push({ k: 'subUrgent', section, title: task.title, text: st.text, urgent: true });
       perform('🗑 Deleted',
         [{ k: 'deleteSub', section, title: task.title, text: st.text }],
-        [{ k: 'addSub',    section, title: task.title, text: st.text, index: at }],
+        inverse,
         { now: true });
     };
     const subMore = item.querySelector('.more-btn');
@@ -2975,9 +3158,12 @@ function buildSubtasks(container, task, section) {
         expandedIds.add(section + '::' + task.title);
         const completedTitle = completedTitleFor(task, st.text);
         const at = (task.subtasks || []).indexOf(st);
+        // Same as removeSub: demoteSub re-attaches it plain, so restore the flag.
+        const inverse = [{ k: 'demoteSub', section, title: task.title, subText: st.text, completedTitle, index: at }];
+        if (st.urgent) inverse.push({ k: 'subUrgent', section, title: task.title, text: st.text, urgent: true });
         perform('✅ Moved to Completed',
           [{ k: 'promoteSub', section, title: task.title, subText: st.text, completedTitle }],
-          [{ k: 'demoteSub',  section, title: task.title, subText: st.text, completedTitle, index: at }]);
+          inverse);
       }, 150);
     });
     makeDraggable(item, 'subtask', { parentTitle: task.title, section, subText: st.text }, '.sub-dh');
@@ -3381,7 +3567,27 @@ function selectedTask() {
   return task ? { task, section, el } : null;
 }
 
-const inField = e => e.target.matches('input,textarea,select') || e.target.isContentEditable;
+// Guard the matches() call: a keydown whose target isn't an element (it can be
+// the document itself) used to throw here, and because this runs first in the
+// handler it took every keyboard shortcut down with it.
+const inField = e => {
+  const el = e.target;
+  return !!el && typeof el.matches === 'function' &&
+         (el.matches('input,textarea,select') || el.isContentEditable);
+};
+
+/* Is something covering the list? Guarding on text fields alone was not
+   enough: open Settings, and focus lands on a button rather than an input, so
+   pressing Backspace deleted whichever task happened to be selected behind the
+   overlay — no confirmation, nothing visible. Same for Space and E while a ⋯
+   menu is open, which acted on the selected card rather than the one whose
+   menu was showing. Escape still has to get through to close these. */
+function overlayOpen() {
+  return document.getElementById('settingsOv').classList.contains('open')
+      || document.getElementById('addSheet').classList.contains('open')
+      || document.getElementById('paletteOv')?.classList.contains('open')
+      || !!openMenuEl;
+}
 
 document.addEventListener('keydown', e => {
   const mod = e.metaKey || e.ctrlKey;
@@ -3399,6 +3605,9 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { closeAdd(); closeSettings(); closeMenu(); closePalette();
                             selectedKey = null; highlightSelected(); return; }
   if (mod) return;
+  // Anything below acts on the list itself, so it must not fire through an
+  // overlay sitting on top of it.
+  if (overlayOpen()) return;
 
   switch (e.key) {
     case 'ArrowDown': case 'j': e.preventDefault(); moveSelection(1);  break;
